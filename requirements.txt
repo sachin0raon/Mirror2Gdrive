@@ -1,0 +1,7 @@
+python-telegram-bot==20.0
+google-api-python-client==2.60.0
+humanize==4.4.0
+python-dotenv==0.21.0
+aria2p==0.11.3
+psutil==5.9.4
+tenacity==8.1.0
