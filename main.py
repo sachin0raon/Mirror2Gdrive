@@ -55,7 +55,7 @@ ARIA_COMMAND = "aria2c --allow-overwrite=true --auto-file-renaming=true --check-
 MAGNET_REGEX = r"magnet:\?xt=urn:btih:[a-zA-Z0-9]*"
 URL_REGEX = r"(?:(?:https?|ftp):\/\/)?[\w/\-?=%.]+\.[\w/\-?=%.]+"
 DOWNLOAD_PATH = "/usr/src/app/downloads"
-ARIA_OPTS = {'dir': DOWNLOAD_PATH.rstrip("/"), 'max-upload-limit': '1M'}
+ARIA_OPTS = {'dir': DOWNLOAD_PATH.rstrip("/"), 'max-upload-limit': '2M'}
 
 def get_user(update: Update) -> Union[str, int]:
     return update.message.from_user.name if update.message.from_user.name is not None else update.message.chat_id
@@ -69,7 +69,7 @@ def get_download_info(down: aria2p.Download) -> str:
     return info
 
 def get_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
-    action_btn = [InlineKeyboardButton(text=f"🔆 Show All [{len(aria2c.get_downloads())}]", callback_data=f"aria-lists")]
+    action_btn = [InlineKeyboardButton(text=f"🔆 Show All ({len(aria2c.get_downloads())})", callback_data=f"aria-lists")]
     if "error" in down.status:
         action_btn.append(InlineKeyboardButton(text="🚀 Retry", callback_data=f"aria-retry#{down.gid}"))
     elif "paused" in down.status:
@@ -152,7 +152,10 @@ async def get_sys_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
               f"<b>Total RAM :</b> {humanize.naturalsize(psutil.virtual_memory().total)}\n" \
               f"<b>Used RAM  :</b> {humanize.naturalsize(psutil.virtual_memory().used)}\n" \
               f"<b>Free RAM  :</b> {humanize.naturalsize(psutil.virtual_memory().available)}\n" \
-              f"<b>Disk Usage:</b> {humanize.naturalsize(psutil.disk_usage('/').used)} of {humanize.naturalsize(psutil.disk_usage('/').total)}\n" \
+              f"<b>Total Disk:</b> {humanize.naturalsize(psutil.disk_usage('/').total)}\n" \
+              f"<b>Used Disk :</b> {humanize.naturalsize(psutil.disk_usage('/').used)}\n" \
+              f"<b>Free Disk :</b> {humanize.naturalsize(psutil.disk_usage('/').free)}\n" \
+              f"<b>Swap Mem  :</b> {humanize.naturalsize(psutil.swap_memory().used)} of {humanize.naturalsize(psutil.swap_memory().total)}\n" \
               f"<b>Network IO:</b> 🔻 {humanize.naturalsize(psutil.net_io_counters().bytes_recv)} 🔺 {humanize.naturalsize(psutil.net_io_counters().bytes_sent)}"
     try:
         details += f"\n<b>Bot Uptime:</b> {humanize.naturaltime(time.time() - BOT_START_TIME)}"
@@ -334,8 +337,13 @@ def upload_to_gdrive(api: aria2p.API, gid: str = None) -> None:
                 else:
                     upload_file(file_path, GDRIVE_FOLDER_ID, creds)
     except RetryError as err:
+        if isinstance(err.last_attempt.exception(), HttpError):
+            reason = str(err.last_attempt.exception().error_details)
+        else:
+            reason = str(err)
+        msg = f"🗂️ <b>File:</b> <code>{aria2c.get_download(gid).name}</code> upload <b>failed</b>❗\n⚠️ <b>Reason:</b> <code>{reason.replace('>', '').replace('<', '')}</code>"
         logger.warning(f"Upload failed for: {aria2c.get_download(gid).name} Total attempts: {err.last_attempt.attempt_number}")
-        send_status_update(f"🗂️ <b>File:</b> <code>{aria2c.get_download(gid).name}</code> upload <b>failed</b>❗\n⚠️ Reason: <b>{str(err)}</b>")
+        send_status_update(msg)
     except (aria2p.ClientException, OSError):
         logger.error("Failed to complete download event task")
 
