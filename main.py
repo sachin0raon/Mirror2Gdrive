@@ -42,6 +42,7 @@ STATUS_CMD = "status"
 INFO_CMD = "info"
 LOG_CMD = "log"
 GDRIVE_BASE_URL = "https://drive.google.com/uc?id={}&export=download"
+GDRIVE_FOLDER_BASE_URL = "https://drive.google.com/drive/folders/{}"
 TRACKER_URLS = [
     "https://cdn.staticaly.com/gh/XIU2/TrackersListCollection/master/all_aria2.txt",
     "https://raw.githubusercontent.com/hezhijie0327/Trackerslist/main/trackerslist_tracker.txt"
@@ -56,6 +57,12 @@ MAGNET_REGEX = r"magnet:\?xt=urn:btih:[a-zA-Z0-9]*"
 URL_REGEX = r"(?:(?:https?|ftp):\/\/)?[\w/\-?=%.]+\.[\w/\-?=%.]+"
 DOWNLOAD_PATH = "/usr/src/app/downloads"
 ARIA_OPTS = {'dir': DOWNLOAD_PATH.rstrip("/"), 'max-upload-limit': '2M'}
+GDRIVE_PERM = {
+    'role': 'reader',
+    'type': 'anyone',
+    'value': None,
+    'withLink': True
+}
 
 def get_user(update: Update) -> Union[str, int]:
     return update.message.from_user.name if update.message.from_user.name is not None else update.message.chat_id
@@ -92,6 +99,8 @@ async def reply_message(msg: str, update: Update,
             reply_markup=keyboard,
             parse_mode=constants.ParseMode.HTML,
         )
+    except AttributeError:
+        logger.error("Failed to send reply")
     except error.TelegramError as err:
         logger.error(f"Failed to reply for: {update.message.text} to: {get_user(update)} error: {str(err)}")
 
@@ -273,6 +282,21 @@ def get_oauth_creds():
                 return None
         return credentials
 
+def count_uploaded_files(creds, folder_id: str) -> int:
+    count = 0
+    logger.info(f"Getting the count of files present in {folder_id}")
+    try:
+        gdrive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+        files_list = gdrive_service.files().list(
+            supportsAllDrives=True, includeItemsFromAllDrives=True, corpora='allDrives',
+            q=f"mimeType != 'application/vnd.google-apps.folder' and trashed=false and parents in '{folder_id}'",
+            spaces='drive', fields='files(id, name, size)').execute()["files"]
+        gdrive_service.close()
+        count = len(files_list)
+    except Exception:
+        logger.error(f"Failed to get details of {folder_id}")
+    return count
+
 def create_folder(folder_name: str, creds) -> Optional[str]:
     folder_id = None
     logger.info(f"Creating folder: {folder_name} in GDrive")
@@ -281,9 +305,15 @@ def create_folder(folder_name: str, creds) -> Optional[str]:
         gdrive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
         upload_dir = gdrive_service.files().create(body=dir_metadata, supportsAllDrives=True, fields='id').execute()
         folder_id = upload_dir.get('id')
-        gdrive_service.close()
     except Exception as err:
         logger.error(f"Failed to create dir: {folder_name} error: {str(err)}")
+    else:
+        logger.info(f"Setting permissions for: {folder_name}")
+        try:
+            gdrive_service.permissions().create(fileId=folder_id, body=GDRIVE_PERM, supportsAllDrives=True).execute()
+            gdrive_service.close()
+        except HttpError:
+            logger.warning(f"Failed to set permission for: {folder_name}")
     return folder_id
 
 @retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=(retry_if_exception_type(Exception)))
@@ -310,17 +340,19 @@ def upload_file(file_path: str, folder_id: str, creds) -> None:
     logger.info(f"Upload completed for {file_name}")
     drive_file = gdrive_service.files().get(fileId=response['id'], supportsAllDrives=True).execute()
     logger.info(f"Setting permissions for {file_name}")
-    permissions = {
-        'role': 'reader',
-        'type': 'anyone',
-        'value': None,
-        'withLink': True
-    }
-    gdrive_service.permissions().create(fileId=drive_file.get('id'), body=permissions, supportsAllDrives=True).execute()
-    gdrive_service.close()
-    send_status_update(f"🗂️ <b>File:</b> <code>{file_name}</code> uploaded ✔️\n🌐 Link: {GDRIVE_BASE_URL.format(drive_file.get('id'))}")
+    try:
+        gdrive_service.permissions().create(fileId=drive_file.get('id'), body=GDRIVE_PERM, supportsAllDrives=True).execute()
+        gdrive_service.close()
+    except HttpError:
+        pass
+    if folder_id == GDRIVE_FOLDER_ID:
+        send_status_update(f"🗂️ <b>File:</b> <code>{file_name}</code> uploaded ✔️\n🌐 <b>Link:</b> {GDRIVE_BASE_URL.format(drive_file.get('id'))}")
 
 def upload_to_gdrive(api: aria2p.API, gid: str = None) -> None:
+    count = 0
+    creds = None
+    folder_id = None
+    is_dir = False
     logger.info("Download complete event triggered")
     try:
         down = aria2c.get_download(gid)
@@ -330,10 +362,12 @@ def upload_to_gdrive(api: aria2p.API, gid: str = None) -> None:
         else:
             if creds := get_oauth_creds():
                 if os.path.isdir(file_path) is True:
-                    folder_id = create_folder(os.path.basename(file_path), creds)
-                    for path, currentDirectory, files in os.walk(file_path):
-                        for f in files:
-                            upload_file(os.path.join(path, f), folder_id, creds)
+                    is_dir = True
+                    if folder_id := create_folder(os.path.basename(file_path), creds):
+                        for path, currentDirectory, files in os.walk(file_path):
+                            for f in files:
+                                count += 1
+                                upload_file(os.path.join(path, f), folder_id, creds)
                 else:
                     upload_file(file_path, GDRIVE_FOLDER_ID, creds)
     except RetryError as err:
@@ -343,9 +377,15 @@ def upload_to_gdrive(api: aria2p.API, gid: str = None) -> None:
             reason = str(err)
         msg = f"🗂️ <b>File:</b> <code>{aria2c.get_download(gid).name}</code> upload <b>failed</b>❗\n⚠️ <b>Reason:</b> <code>{reason.replace('>', '').replace('<', '')}</code>"
         logger.warning(f"Upload failed for: {aria2c.get_download(gid).name} Total attempts: {err.last_attempt.attempt_number}")
-        send_status_update(msg)
+        if is_dir is False:
+            send_status_update(msg)
     except (aria2p.ClientException, OSError):
         logger.error("Failed to complete download event task")
+    if is_dir is True:
+        if count == count_uploaded_files(creds, folder_id):
+            send_status_update(f"🗂️ <b>Folder: </b><code>{aria2c.get_download(gid).name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: <b><code>{GDRIVE_FOLDER_BASE_URL.format(folder_id)}</code>")
+        else:
+            send_status_update(f"🗂️ <b>Folder: </b><code>{aria2c.get_download(gid).name}</code> upload <b>failed</b>❗\n⚠️ <i>Please check the log for more details using</i> <code>/{LOG_CMD}</code>")
 
 def start_aria() -> None:
     trackers = ''
