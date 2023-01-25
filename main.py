@@ -121,14 +121,19 @@ def get_oauth_creds():
                 return None
         return credentials
 
-def count_uploaded_files(creds, folder_id: str) -> int:
+def count_uploaded_files(creds = None, folder_id: str = None, file_name: str = None) -> int:
     count = 0
-    logger.info(f"Getting the count of files present in {folder_id}")
+    if folder_id is not None:
+        logger.info(f"Getting the count of files present in {folder_id}")
+        query = f"mimeType != 'application/vnd.google-apps.folder' and trashed=false and parents in '{folder_id}'"
+    else:
+        logger.info(f"Searching for: {file_name}")
+        file_name = file_name.replace("'", "\\'")
+        query = f"fullText contains '{file_name}' and trashed=false and parents in '{GDRIVE_FOLDER_ID}'"
     try:
-        gdrive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+        gdrive_service = build('drive', 'v3', credentials=creds if creds is not None else get_oauth_creds(), cache_discovery=False)
         files_list = gdrive_service.files().list(
-            supportsAllDrives=True, includeItemsFromAllDrives=True, corpora='allDrives',
-            q=f"mimeType != 'application/vnd.google-apps.folder' and trashed=false and parents in '{folder_id}'",
+            supportsAllDrives=True, includeItemsFromAllDrives=True, corpora='allDrives', q=query,
             spaces='drive', fields='files(id, name, size)').execute()["files"]
         gdrive_service.close()
         count = len(files_list)
@@ -163,7 +168,7 @@ def upload_file(file_path: str, folder_id: str, creds) -> None:
     gdrive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
     drive_file = gdrive_service.files().create(
         body=file_metadata, supportsAllDrives=True,
-        media_body=MediaFileUpload(filename=file_path, resumable=True),
+        media_body=MediaFileUpload(filename=file_path, resumable=True, chunksize=50 * 1024 * 1024),
         fields='id')
     response = None
     while response is None:
@@ -210,6 +215,8 @@ def upload_to_gdrive(api: aria2p.API = None, gid: str = None, hash: str = None) 
             logger.info(f"Skip uploading of: {file_name}")
         else:
             if creds := get_oauth_creds():
+                if hash is None:
+                    send_status_update(f"🗂️ <b>File: </b><code>{file_name}</code> <b>upload started</b> ⏳")
                 if os.path.isdir(file_path) is True:
                     is_dir = True
                     if folder_id := create_folder(os.path.basename(file_path), creds):
@@ -231,7 +238,7 @@ def upload_to_gdrive(api: aria2p.API = None, gid: str = None, hash: str = None) 
     except (aria2p.ClientException, OSError, AttributeError):
         logger.error("Failed to complete download event task")
     if is_dir is True:
-        if count == count_uploaded_files(creds, folder_id):
+        if count == count_uploaded_files(creds=creds, folder_id=folder_id):
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: <b><code>{GDRIVE_FOLDER_BASE_URL.format(folder_id)}</code>")
         else:
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <i>Please check the log for more details using</i> <code>/{LOG_CMD}</code>")
@@ -240,7 +247,7 @@ def get_user(update: Update) -> Union[str, int]:
     return update.message.from_user.name if update.message.from_user.name is not None else update.message.chat_id
 
 def get_download_info(down: aria2p.Download) -> str:
-    info = f"🗂 <b>Filename:</b> <code>{down.name}</code>\n🚦 <b>Status:</b> <code>{down.status}</code>\n📀 <b>Size:</b> <code>{down.total_length_string()}</code>\n"\
+    info = f"🗂 <b>Name:</b> <code>{down.name}</code>\n🚦 <b>Status:</b> <code>{down.status}</code>\n📀 <b>Size:</b> <code>{down.total_length_string()}</code>\n"\
             f"📥 <b>Downloaded:</b> <code>{down.completed_length_string()} ({down.progress_string()})</code>\n🧩 <b>Peers:</b> <code>{down.connections}</code>\n"\
             f"⚡ <b>Speed:</b> <code>{down.download_speed_string()}</code>\n⏳ <b>ETA:</b> <code>{down.eta_string()}</code>"
     if down.bittorrent is not None:
@@ -251,7 +258,7 @@ def get_download_info(down: aria2p.Download) -> str:
 def get_qbit_info(hash: str, client: qbittorrentapi.Client = None) -> str:
     info = ''
     for torrent in client.torrents_info(torrent_hashes=[hash]):
-        info += f"🗂 <b>Filename:</b> <code>{torrent.name}</code>\n🚦 <b>Status:</b> <code>{torrent.state_enum.value}</code>\n📀 <b>Size:</b> <code>{humanize.naturalsize(torrent.total_size)}</code>\n"\
+        info += f"🗂 <b>Name:</b> <code>{torrent.name}</code>\n🚦 <b>Status:</b> <code>{torrent.state_enum.value}</code>\n📀 <b>Size:</b> <code>{humanize.naturalsize(torrent.total_size)}</code>\n"\
             f"📥 <b>Downloaded:</b> <code>{humanize.naturalsize(torrent.downloaded)} ({round(number=torrent.progress * 100, ndigits=2)}%)</code>\n📦 <b>Remaining: </b><code>{humanize.naturalsize(torrent.amount_left)}</code>\n"\
             f"🧩 <b>Peers:</b> <code>{torrent.num_leechs}</code>\n🥑 <b>Seeders:</b> <code>{torrent.num_seeds}</code>\n⚡ <b>Speed:</b> <code>{humanize.naturalsize(torrent.dlspeed)}/s</code>\n"\
             f"⏳ <b>ETA:</b> <code>{humanize.naturaldelta(torrent.eta)}</code>\n⚙️ <b>Engine: </b><code>Qbittorent</code>"
@@ -377,17 +384,18 @@ async def aria_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
                         qb_client.torrents_delete(delete_files=True, torrent_hashes=[torrent_hash])
                     await get_aria_downloads(update, context)
                 elif "upload" in action:
-                    threading.Thread(target=upload_to_gdrive, kwargs={'hash': torrent_hash}).start()
-                    logger.info(f"Upload thread started for: {torrent_hash}")
-                    await context.bot.send_message(
-                        chat_id=update.callback_query.message.chat_id,
-                        text=f"🌈 <b>Upload started for: </b><code>{qb_client.torrents_info(torrent_hashes=[torrent_hash])[0].name}</code>\n⚠️ <i>Do not press the upload button again unless the upload has failed</i>",
-                        parse_mode=constants.ParseMode.HTML)
+                    name = qb_client.torrents_info(torrent_hashes=[torrent_hash])[0].name
+                    if count_uploaded_files(file_name=name) > 0:
+                        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already uploaded</b> and can be found in {GDRIVE_FOLDER_BASE_URL.format(GDRIVE_FOLDER_ID)}"
+                    else:
+                        msg = f"🌈 <b>Upload started for: </b><code>{name}</code>\n⚠️ <i>Do not press the upload button again unless the upload has failed</i>"
+                        threading.Thread(target=upload_to_gdrive, kwargs={'hash': torrent_hash}, daemon=True).start()
+                        logger.info(f"Upload thread started for: {torrent_hash}")
+                    await edit_message(msg, update.callback_query)
                 qb_client.auth_log_out()
     except aria2p.ClientException:
-        await edit_message(f"⁉️ <b>Unable to find GID:</b><code>{update.callback_query.data}</code>",
-                           update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="", callback_data="")]]))
-    except (error.TelegramError, requests.exceptions.RequestException, IndexError, ValueError):
+        await edit_message(f"⁉️ <b>Unable to find GID:</b><code>{update.callback_query.data}</code>", update.callback_query)
+    except (error.TelegramError, requests.exceptions.RequestException, IndexError, ValueError, RuntimeError):
         logger.error(f"Failed to answer callback for: {update.callback_query.data}")
 
 async def get_sys_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -455,7 +463,7 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if aria_obj is not None:
             if aria_obj.has_failed is False:
                 logger.info(f"Download started: {aria_obj.name} with GID: {aria_obj.gid}")
-                await reply_message(get_download_info(aria_obj), update, context, get_keyboard(aria_obj), False)
+                await reply_message(f"📥 <b>Downloaded started</b> ✔️\n<i>Send /{STATUS_CMD} to view</i>", update, context)
             else:
                 logger.error(f"Failed to start download: {link} error: {aria_obj.error_code}")
                 await reply_message(f"⚠️ <b>Failed to start download</b>\nError:<code>{aria_obj.error_message}</code> ❗", update, context)
@@ -469,7 +477,7 @@ async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             link = update.message.text.strip().split(" ", maxsplit=1)[1].strip()
             resp = qb_client.torrents_add(urls=link)
             if resp == "Ok.":
-                await reply_message("🧲 <b>Torrent added</b> ✔️", update, context)
+                await reply_message(f"🧲 <b>Torrent added</b> ✔️\n<i>Send /{STATUS_CMD} to view</i>", update, context)
             else:
                 await reply_message("❗ <b>Failed to add it</b>\n⚠️ <i>Kindly verify the given link and retry</i>", update, context)
         except IndexError:
