@@ -5,3 +5,4 @@ python-dotenv==0.21.0
 aria2p==0.11.3
 psutil==5.9.4
 tenacity==8.1.0
+qbittorrent-api==2022.11.40

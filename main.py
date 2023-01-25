@@ -40,7 +40,7 @@ GDRIVE_FOLDER_ID = None
 AUTHORIZED_USERS = set()
 PICKLE_FILE_NAME = "token.pickle"
 START_CMD = "start"
-MIRROR_CMD = "mirror"
+MIRROR_CMD = "aria"
 STATUS_CMD = "status"
 INFO_CMD = "info"
 LOG_CMD = "log"
@@ -427,7 +427,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await update.get_bot().set_my_commands(
             [(START_CMD, "👽 Start the bot"),
-             (MIRROR_CMD, "🧲 Mirror file to GDrive"),
+             (MIRROR_CMD, "🗳 Mirror file using Aria2"),
+             (QBIT_CMD, "🧲 Mirror file using Qbittorrent"),
              (STATUS_CMD, "📥 Show the task list"),
              (INFO_CMD, "⚙️ Show system info"),
              (LOG_CMD, "📄 Get runtime log file")]
@@ -439,7 +440,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update, context
     )
 
-async def mirror(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"/{MIRROR_CMD} sent by {get_user(update)}")
     aria_obj: aria2p.Download = None
     try:
@@ -490,13 +491,13 @@ def start_bot() -> None:
         logger.info("Registering commands")
         try:
             start_handler = CommandHandler(START_CMD, start, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
-            mirror_handler = CommandHandler(MIRROR_CMD, mirror, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
+            aria_handler = CommandHandler(MIRROR_CMD, aria_upload, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             status_handler = CommandHandler(STATUS_CMD, get_aria_downloads, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             info_handler = CommandHandler(INFO_CMD, get_sys_info, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             log_handler = CommandHandler(LOG_CMD, send_log_file, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             qbit_handler = CommandHandler(QBIT_CMD, qbit_upload, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             callback_handler = CallbackQueryHandler(aria_callback_handler, pattern="^aria|qbit")
-            application.add_handlers([start_handler, mirror_handler, callback_handler, status_handler, info_handler, log_handler, qbit_handler])
+            application.add_handlers([start_handler, aria_handler, callback_handler, status_handler, info_handler, log_handler, qbit_handler])
             application.run_polling(drop_pending_updates=True)
         except error.TelegramError as err:
             logger.error(f"Failed to start bot: {str(err)}")
