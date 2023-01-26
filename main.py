@@ -239,7 +239,7 @@ def upload_to_gdrive(api: aria2p.API = None, gid: str = None, hash: str = None) 
         logger.error("Failed to complete download event task")
     if is_dir is True:
         if count == count_uploaded_files(creds=creds, folder_id=folder_id):
-            send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: <b><code>{GDRIVE_FOLDER_BASE_URL.format(folder_id)}</code>")
+            send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: </b><code>{GDRIVE_FOLDER_BASE_URL.format(folder_id)}</code>")
         else:
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <i>Please check the log for more details using</i> <code>/{LOG_CMD}</code>")
 
@@ -349,6 +349,25 @@ async def get_aria_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await reply_message(msg, update, context, keyboard, False)
 
+def get_sys_info() -> str:
+    details = f"<b>CPU Usage :</b> {psutil.cpu_percent(interval=None)}%\n" \
+              f"<b>CPU Freq  :</b> {math.ceil(psutil.cpu_freq(percpu=False).current)} MHz\n" \
+              f"<b>CPU Cores :</b> {psutil.cpu_count(logical=True)}\n" \
+              f"<b>Total RAM :</b> {humanize.naturalsize(psutil.virtual_memory().total)}\n" \
+              f"<b>Used RAM  :</b> {humanize.naturalsize(psutil.virtual_memory().used)}\n" \
+              f"<b>Free RAM  :</b> {humanize.naturalsize(psutil.virtual_memory().available)}\n" \
+              f"<b>Total Disk:</b> {humanize.naturalsize(psutil.disk_usage('/').total)}\n" \
+              f"<b>Used Disk :</b> {humanize.naturalsize(psutil.disk_usage('/').used)}\n" \
+              f"<b>Free Disk :</b> {humanize.naturalsize(psutil.disk_usage('/').free)}\n" \
+              f"<b>Swap Mem  :</b> {humanize.naturalsize(psutil.swap_memory().used)} of {humanize.naturalsize(psutil.swap_memory().total)}\n" \
+              f"<b>Threads   :</b> {threading.active_count()}\n" \
+              f"<b>Network IO:</b> 🔻 {humanize.naturalsize(psutil.net_io_counters().bytes_recv)} 🔺 {humanize.naturalsize(psutil.net_io_counters().bytes_sent)}"
+    try:
+        details += f"\n<b>Bot Uptime:</b> {humanize.naturaltime(time.time() - BOT_START_TIME)}"
+    except OverflowError:
+        pass
+    return details
+
 async def aria_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await update.callback_query.answer()
@@ -368,7 +387,7 @@ async def aria_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 elif "remove" in action:
                     aria2c.remove(downloads=[aria_obj], force=True, files=True, clean=True)
                 await get_aria_downloads(update, context)
-        else:
+        elif "qbit" in action:
             torrent_hash = callback_data[1].strip() if len(callback_data) > 1 else None
             if qb_client := get_qbit_client():
                 if action in ["qbit-refresh", "qbit-file", "qbit-pause", "qbit-resume"]:
@@ -376,7 +395,10 @@ async def aria_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
                         qb_client.torrents_pause(torrent_hashes=[torrent_hash])
                     elif "resume" in action:
                         qb_client.torrents_resume(torrent_hashes=[torrent_hash])
-                    await edit_message(get_qbit_info(torrent_hash, qb_client), update.callback_query, get_qbit_keyboard(qb_client.torrents_info(torrent_hashes=[torrent_hash])[0]))
+                    if msg := get_qbit_info(torrent_hash, qb_client):
+                        await edit_message(msg, update.callback_query, get_qbit_keyboard(qb_client.torrents_info(torrent_hashes=[torrent_hash])[0]))
+                    else:
+                        await edit_message("<b>Torrent not found</b> ❗", update.callback_query)
                 elif action in ["qbit-retry", "qbit-remove", "qbit-lists"]:
                     if "retry" in action:
                         qb_client.torrents_set_force_start(enable=True, torrent_hashes=[torrent_hash])
@@ -391,31 +413,25 @@ async def aria_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
                         msg = f"🌈 <b>Upload started for: </b><code>{name}</code>\n⚠️ <i>Do not press the upload button again unless the upload has failed</i>"
                         threading.Thread(target=upload_to_gdrive, kwargs={'hash': torrent_hash}, daemon=True).start()
                         logger.info(f"Upload thread started for: {torrent_hash}")
-                    await edit_message(msg, update.callback_query)
+                    await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"qbit-file#{torrent_hash}")]]))
                 qb_client.auth_log_out()
+        else:
+            if "refresh" == callback_data[1]:
+                await edit_message(get_sys_info(), update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="♻️ Refresh", callback_data="sys#refresh"), InlineKeyboardButton(text="🚫 Close", callback_data="sys#close")]]))
+            if "close" == callback_data[1]:
+                try:
+                    await update.callback_query.delete_message()
+                except error.TelegramError:
+                    await edit_message("<b>Sys info data cleared</b>", update.callback_query)
     except aria2p.ClientException:
-        await edit_message(f"⁉️ <b>Unable to find GID:</b><code>{update.callback_query.data}</code>", update.callback_query)
+        await edit_message(f"⁉️ <b>Unable to find GID:</b> <code>{update.callback_query.data}</code>", update.callback_query)
     except (error.TelegramError, requests.exceptions.RequestException, IndexError, ValueError, RuntimeError):
         logger.error(f"Failed to answer callback for: {update.callback_query.data}")
 
-async def get_sys_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    details = f"<b>CPU Usage :</b> {psutil.cpu_percent(interval=None)}%\n" \
-              f"<b>CPU Freq  :</b> {math.ceil(psutil.cpu_freq(percpu=False).current)} MHz\n" \
-              f"<b>CPU Cores :</b> {psutil.cpu_count(logical=True)}\n" \
-              f"<b>Total RAM :</b> {humanize.naturalsize(psutil.virtual_memory().total)}\n" \
-              f"<b>Used RAM  :</b> {humanize.naturalsize(psutil.virtual_memory().used)}\n" \
-              f"<b>Free RAM  :</b> {humanize.naturalsize(psutil.virtual_memory().available)}\n" \
-              f"<b>Total Disk:</b> {humanize.naturalsize(psutil.disk_usage('/').total)}\n" \
-              f"<b>Used Disk :</b> {humanize.naturalsize(psutil.disk_usage('/').used)}\n" \
-              f"<b>Free Disk :</b> {humanize.naturalsize(psutil.disk_usage('/').free)}\n" \
-              f"<b>Swap Mem  :</b> {humanize.naturalsize(psutil.swap_memory().used)} of {humanize.naturalsize(psutil.swap_memory().total)}\n" \
-              f"<b>Threads   :</b> {threading.active_count()}\n" \
-              f"<b>Network IO:</b> 🔻 {humanize.naturalsize(psutil.net_io_counters().bytes_recv)} 🔺 {humanize.naturalsize(psutil.net_io_counters().bytes_sent)}"
-    try:
-        details += f"\n<b>Bot Uptime:</b> {humanize.naturaltime(time.time() - BOT_START_TIME)}"
-    except OverflowError:
-        pass
-    await reply_message(details, update, context)
+async def sys_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await reply_message(get_sys_info(), update, context,
+                        InlineKeyboardMarkup([[InlineKeyboardButton(text="♻️ Refresh", callback_data="sys#refresh"),
+                                               InlineKeyboardButton(text="🚫 Close", callback_data="sys#close")]]), False)
 
 async def send_log_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"Sending log file to {get_user(update)}")
@@ -463,7 +479,7 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if aria_obj is not None:
             if aria_obj.has_failed is False:
                 logger.info(f"Download started: {aria_obj.name} with GID: {aria_obj.gid}")
-                await reply_message(f"📥 <b>Downloaded started</b> ✔️\n<i>Send /{STATUS_CMD} to view</i>", update, context)
+                await reply_message(f"📥 <b>Download started</b> ✔️\n<i>Send /{STATUS_CMD} to view</i>", update, context)
             else:
                 logger.error(f"Failed to start download: {link} error: {aria_obj.error_code}")
                 await reply_message(f"⚠️ <b>Failed to start download</b>\nError:<code>{aria_obj.error_message}</code> ❗", update, context)
@@ -501,10 +517,10 @@ def start_bot() -> None:
             start_handler = CommandHandler(START_CMD, start, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             aria_handler = CommandHandler(MIRROR_CMD, aria_upload, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             status_handler = CommandHandler(STATUS_CMD, get_aria_downloads, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
-            info_handler = CommandHandler(INFO_CMD, get_sys_info, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
+            info_handler = CommandHandler(INFO_CMD, sys_info_handler, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             log_handler = CommandHandler(LOG_CMD, send_log_file, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             qbit_handler = CommandHandler(QBIT_CMD, qbit_upload, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
-            callback_handler = CallbackQueryHandler(aria_callback_handler, pattern="^aria|qbit")
+            callback_handler = CallbackQueryHandler(aria_callback_handler, pattern="^aria|qbit|sys")
             application.add_handlers([start_handler, aria_handler, callback_handler, status_handler, info_handler, log_handler, qbit_handler])
             application.run_polling(drop_pending_updates=True)
         except error.TelegramError as err:
