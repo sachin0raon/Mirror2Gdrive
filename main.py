@@ -204,7 +204,7 @@ def upload_to_gdrive(api: aria2p.API = None, gid: str = None, hash: str = None) 
     try:
         if hash is not None:
             if qb_client := get_qbit_client():
-                file_name = qb_client.torrents_info(torrent_hashes=[hash])[0].name
+                file_name = qb_client.torrents_files(torrent_hash=hash)[0].get('name').split("/")[0]
                 file_path = f"{DOWNLOAD_PATH}/{file_name}"
                 qb_client.auth_log_out()
         else:
@@ -237,6 +237,8 @@ def upload_to_gdrive(api: aria2p.API = None, gid: str = None, hash: str = None) 
             send_status_update(msg)
     except (aria2p.ClientException, OSError, AttributeError):
         logger.error("Failed to complete download event task")
+    except qbittorrentapi.exceptions.NotFound404Error:
+        logger.error("Failed to get torrent hash info")
     if is_dir is True:
         if count == count_uploaded_files(creds=creds, folder_id=folder_id):
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: </b><code>{GDRIVE_FOLDER_BASE_URL.format(folder_id)}</code>")
@@ -252,7 +254,12 @@ def get_download_info(down: aria2p.Download) -> str:
             f"⚡ <b>Speed:</b> <code>{down.download_speed_string()}</code>\n⏳ <b>ETA:</b> <code>{down.eta_string()}</code>"
     if down.bittorrent is not None:
         info += f"\n🥑 <b>Seeders:</b> <code>{down.num_seeders}</code>"
-    info += "\n⚙️ <b>Engine: </b><code>Aria2</code>"
+    info += f"\n⚙️ <b>Engine: </b><code>Aria2</code>\n📚 <b>Total Files:</b> <code>{len(down.files)}</code>\n"
+    if len(down.files) > 1:
+        for aria_file in down.files:
+            if aria_file.is_metadata is True:
+                continue
+            info += f"📄 {os.path.basename(aria_file.path.name)} <code>[{aria_file.completed_length_string()}/{aria_file.length_string()}]</code>\n"
     return info
 
 def get_qbit_info(hash: str, client: qbittorrentapi.Client = None) -> str:
@@ -262,6 +269,13 @@ def get_qbit_info(hash: str, client: qbittorrentapi.Client = None) -> str:
             f"📥 <b>Downloaded:</b> <code>{humanize.naturalsize(torrent.downloaded)} ({round(number=torrent.progress * 100, ndigits=2)}%)</code>\n📦 <b>Remaining: </b><code>{humanize.naturalsize(torrent.amount_left)}</code>\n"\
             f"🧩 <b>Peers:</b> <code>{torrent.num_leechs}</code>\n🥑 <b>Seeders:</b> <code>{torrent.num_seeds}</code>\n⚡ <b>Speed:</b> <code>{humanize.naturalsize(torrent.dlspeed)}/s</code>\n"\
             f"⏳ <b>ETA:</b> <code>{humanize.naturaldelta(torrent.eta)}</code>\n⚙️ <b>Engine: </b><code>Qbittorent</code>"
+        try:
+            info += f"\n📚 <b>Total Files:</b> <code>{len(client.torrents_files(torrent_hash=hash))}</code>\n"
+            if len(client.torrents_files(torrent_hash=hash)) > 1:
+                for torrent_file in client.torrents_files(torrent_hash=hash):
+                    info += f"📄 {os.path.basename(torrent_file.get('name'))} <code>[{round(number=torrent_file.get('progress') * 100, ndigits=1)}%|{humanize.naturalsize(torrent_file.get('size'))}]</code>\n"
+        except qbittorrentapi.exceptions.NotFound404Error:
+            pass
     return info
 
 def get_downloads_count() -> int:
@@ -326,8 +340,8 @@ async def edit_message(msg: str, callback: CallbackQuery, keyboard: InlineKeyboa
             parse_mode=constants.ParseMode.HTML,
             reply_markup=keyboard
         )
-    except error.TelegramError:
-        logger.error(f"Failed to edit message for: {callback.data}")
+    except error.TelegramError as err:
+        logger.error(f"Failed to edit message for: {callback.data} error: {str(err)}")
 
 async def get_aria_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     file_btns = []
@@ -460,7 +474,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except (error.TelegramError, RuntimeError):
         logger.error("Failed to set commands")
     await reply_message(
-        f"Hi 👋, Welcome to <b>Aria2Gdrive</b> bot. I can mirror files to your GDrive. Please use <code>/{MIRROR_CMD}</code> cmd to send links.",
+        f"Hi 👋, Welcome to <b>Mirror2Gdrive</b> bot. I can mirror files to your GDrive. Please use <code>/{MIRROR_CMD}</code> or <code>/{QBIT_CMD}</code> cmd to send links.",
         update, context
     )
 
@@ -485,6 +499,8 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await reply_message(f"⚠️ <b>Failed to start download</b>\nError:<code>{aria_obj.error_message}</code> ❗", update, context)
     except IndexError:
         await reply_message("😡 <b>Send a link along with the command</b>❗", update, context)
+    except aria2p.ClientException:
+        await reply_message("❗ <b>Failed to start download, kindly check the link and retry.</b>", update, context)
 
 async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"/{QBIT_CMD} sent by {get_user(update)}")
