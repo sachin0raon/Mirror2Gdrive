@@ -13,6 +13,8 @@ import subprocess
 import threading
 import qbittorrentapi
 from qbit_conf import QBIT_CONF
+from pyngrok import ngrok, conf
+from urllib.parse import quote
 from io import StringIO
 from typing import Union, Optional
 from dotenv import load_dotenv
@@ -36,6 +38,7 @@ aria2c: aria2p.API = None
 CONFIG_FILE_URL = os.getenv("CONFIG_FILE_URL")
 BOT_START_TIME = None
 BOT_TOKEN = None
+NGROK_AUTH_TOKEN = None
 GDRIVE_FOLDER_ID = None
 AUTHORIZED_USERS = set()
 PICKLE_FILE_NAME = "token.pickle"
@@ -289,33 +292,53 @@ def get_downloads_count() -> int:
         logger.error("Failed to get total count of download tasks")
     return count
 
+def get_ngrok_btn(file_name: str) -> Optional[InlineKeyboardButton]:
+    try:
+        if tunnels := ngrok.get_tunnels():
+            return InlineKeyboardButton(text="🌐 Ngrok URL", url=f"{tunnels[0].public_url}/{quote(file_name)}")
+    except (IndexError, ngrok.PyngrokError) as err:
+        logger.error(f"Failed to get ngrok tunnel, error: {str(err)}")
+        return None
+
 def get_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
-    action_btn = [InlineKeyboardButton(text=f"🔆 Show All ({get_downloads_count()})", callback_data=f"aria-lists")]
-    if "error" in down.status:
-        action_btn.append(InlineKeyboardButton(text="🚀 Retry", callback_data=f"aria-retry#{down.gid}"))
-    elif "paused" in down.status:
-        action_btn.append(InlineKeyboardButton(text="▶ Resume", callback_data=f"aria-resume#{down.gid}"))
-    elif "active" in down.status:
-        action_btn.append(InlineKeyboardButton(text="⏸ Pause", callback_data=f"aria-pause#{down.gid}"))
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(text="♻ Refresh", callback_data=f"aria-refresh#{down.gid}"),
-          InlineKeyboardButton(text="🚫 Delete", callback_data=f"aria-remove#{down.gid}")], action_btn]
-    )
+    refresh_btn = InlineKeyboardButton(text="♻ Refresh", callback_data=f"aria-refresh#{down.gid}")
+    delete_btn = InlineKeyboardButton(text="🚫 Delete", callback_data=f"aria-remove#{down.gid}")
+    show_all_btn = InlineKeyboardButton(text=f"🔆 Show All ({get_downloads_count()})", callback_data=f"aria-lists")
+    ngrok_btn = get_ngrok_btn(down.name)
+    action_btn = [[show_all_btn, delete_btn]]
+    if "error" == down.status:
+        action_btn.insert(0, [refresh_btn, InlineKeyboardButton(text="🚀 Retry", callback_data=f"aria-retry#{down.gid}")])
+    elif "paused" == down.status:
+        action_btn.insert(0, [refresh_btn, InlineKeyboardButton(text="▶ Resume", callback_data=f"aria-resume#{down.gid}")])
+    elif "active" == down.status:
+        action_btn.insert(0, [refresh_btn, InlineKeyboardButton(text="⏸ Pause", callback_data=f"aria-pause#{down.gid}")])
+    elif "complete" == down.status:
+        action_btn = [[ngrok_btn, delete_btn], [show_all_btn]] if ngrok_btn else [[show_all_btn, delete_btn]]
+    else:
+        action_btn = [[refresh_btn, delete_btn], [show_all_btn]]
+    return InlineKeyboardMarkup(action_btn)
 
 def get_qbit_keyboard(qbit: qbittorrentapi.TorrentDictionary = None) -> InlineKeyboardMarkup:
-    action_btn = [InlineKeyboardButton(text=f"🔆 Show All ({get_downloads_count()})", callback_data=f"qbit-lists")]
+    refresh_btn = InlineKeyboardButton(text="♻ Refresh", callback_data=f"qbit-refresh#{qbit.hash}")
+    delete_btn = InlineKeyboardButton(text="🚫 Delete", callback_data=f"qbit-remove#{qbit.hash}")
+    show_all_btn = InlineKeyboardButton(text=f"🔆 Show All ({get_downloads_count()})", callback_data=f"qbit-lists")
+    upload_btn = InlineKeyboardButton(text="☁️ Upload", callback_data=f"qbit-upload#{qbit.hash}")
+    ngrok_btn = get_ngrok_btn(qbit.files[0].get('name').split("/")[0])
+    action_btn = [[show_all_btn, delete_btn]]
     if qbit.state_enum.is_errored:
-        action_btn.append(InlineKeyboardButton(text="🚀 Retry", callback_data=f"qbit-retry#{qbit.hash}"))
+        action_btn.insert(0, [refresh_btn, InlineKeyboardButton(text="🚀 Retry", callback_data=f"qbit-retry#{qbit.hash}")])
     elif "pausedDL" == qbit.state_enum.value:
-        action_btn.append(InlineKeyboardButton(text="▶ Resume", callback_data=f"qbit-resume#{qbit.hash}"))
+        action_btn.insert(0, [refresh_btn, InlineKeyboardButton(text="▶ Resume", callback_data=f"qbit-resume#{qbit.hash}")])
     elif qbit.state_enum.is_downloading:
-        action_btn.append(InlineKeyboardButton(text="⏸ Pause", callback_data=f"qbit-pause#{qbit.hash}"))
+        action_btn.insert(0, [refresh_btn, InlineKeyboardButton(text="⏸ Pause", callback_data=f"qbit-pause#{qbit.hash}")])
     elif qbit.state_enum.is_complete or "pausedUP" == qbit.state_enum.value:
-        action_btn.append(InlineKeyboardButton(text="☁️ Upload", callback_data=f"qbit-upload#{qbit.hash}"))
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(text="♻ Refresh", callback_data=f"qbit-refresh#{qbit.hash}"),
-          InlineKeyboardButton(text="🚫 Delete", callback_data=f"qbit-remove#{qbit.hash}")], action_btn]
-    )
+        if ngrok_btn:
+            action_btn.insert(0, [ngrok_btn, upload_btn])
+        else:
+            action_btn = [[upload_btn, delete_btn], [show_all_btn]]
+    else:
+        action_btn = [[refresh_btn, delete_btn], [show_all_btn]]
+    return InlineKeyboardMarkup(action_btn)
 
 async def reply_message(msg: str, update: Update,
                         context: ContextTypes.DEFAULT_TYPE,
@@ -341,7 +364,7 @@ async def edit_message(msg: str, callback: CallbackQuery, keyboard: InlineKeyboa
             reply_markup=keyboard
         )
     except error.TelegramError as err:
-        logger.error(f"Failed to edit message for: {callback.data} error: {str(err)}")
+        logger.debug(f"Failed to edit message for: {callback.data} error: {str(err)}")
 
 async def get_aria_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     file_btns = []
@@ -378,7 +401,8 @@ def get_sys_info() -> str:
               f"<b>Network IO:</b> 🔻 {humanize.naturalsize(psutil.net_io_counters().bytes_recv)} 🔺 {humanize.naturalsize(psutil.net_io_counters().bytes_sent)}"
     try:
         details += f"\n<b>Bot Uptime:</b> {humanize.naturaltime(time.time() - BOT_START_TIME)}"
-    except OverflowError:
+        details += f"\n<b>Ngrok URL:</b> {ngrok.get_tunnels()[0].public_url}"
+    except (OverflowError, IndexError, ngrok.PyngrokError):
         pass
     return details
 
@@ -599,10 +623,31 @@ def start_qbit() -> None:
         logger.error("Failed to start qbittorrent-nox")
         exit()
 
+def start_ngrok() -> None:
+    logger.info("Starting ngrok tunnel")
+    with open("/usr/src/app/ngrok.yml", "w") as config:
+        config.write(f"version: 2\nauthtoken: {NGROK_AUTH_TOKEN}\nregion: in\nconsole_ui: false\nlog_level: info")
+    ngrok_conf = conf.PyngrokConfig(
+        config_path="/usr/src/app/ngrok.yml",
+        auth_token=NGROK_AUTH_TOKEN,
+        region="in",
+        max_logs=5,
+        ngrok_version="v3",
+        monitor_thread=False)
+    try:
+        conf.set_default(ngrok_conf)
+        file_tunnel = ngrok.connect(addr=f"file://{DOWNLOAD_PATH}", proto="http", schemes=["http"], name="files_tunnel", inspect=False)
+        logger.info(f"Ngrok tunnel started: {file_tunnel.public_url}")
+    except ngrok.PyngrokError as err:
+        logger.error(f"Failed to start ngrok, error: {str(err)}")
+        exit()
+
 def setup_bot() -> None:
     global BOT_TOKEN
+    global NGROK_AUTH_TOKEN
     global GDRIVE_FOLDER_ID
     global AUTHORIZED_USERS
+    os.makedirs(name=DOWNLOAD_PATH, exist_ok=True)
     if CONFIG_FILE_URL is not None:
         logger.info("Downloading config file")
         try:
@@ -615,6 +660,7 @@ def setup_bot() -> None:
                 if load_dotenv(stream=StringIO(config_file.text), override=True):
                     config_file.close()
                     BOT_TOKEN = os.environ['BOT_TOKEN']
+                    NGROK_AUTH_TOKEN = os.environ['NGROK_AUTH_TOKEN']
                     GDRIVE_FOLDER_ID = os.environ['GDRIVE_FOLDER_ID']
                     try:
                         AUTHORIZED_USERS = json.loads(os.environ['USER_LIST'])
@@ -634,6 +680,7 @@ def setup_bot() -> None:
                                 logger.info("config.env data loaded successfully")
                                 start_aria()
                                 start_qbit()
+                                start_ngrok()
                                 start_bot()
                             else:
                                 logger.error("Failed to get pickle file data")
