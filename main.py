@@ -321,8 +321,11 @@ def get_aria_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
         action_btn.insert(0, [buttons["refresh"], buttons["resume"]])
     elif "active" == down.status:
         action_btn.insert(0, [buttons["refresh"], buttons["pause"]])
-    elif "complete" == down.status:
-        action_btn = [[ngrok_btn, buttons["delete"]], [buttons["show_all"]]] if ngrok_btn else [[buttons["show_all"], buttons["delete"]]]
+    elif "complete" == down.status and down.is_metadata is False:
+        if ngrok_btn:
+            action_btn = [[ngrok_btn, buttons["upload"]], [buttons["show_all"], buttons["delete"]]]
+        else:
+            action_btn = [[buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
     else:
         action_btn = [[buttons["refresh"], buttons["delete"]], [buttons["show_all"]]]
     return InlineKeyboardMarkup(action_btn)
@@ -412,7 +415,17 @@ def get_sys_info() -> str:
         pass
     return details
 
-async def aria_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def trigger_upload(name: str, prog: str, file_id: str, update: Update) -> None:
+    if count_uploaded_files(file_name=name) > 0:
+        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already uploaded</b> and can be found in {GDRIVE_FOLDER_BASE_URL.format(GDRIVE_FOLDER_ID)}"
+    else:
+        msg = f"🌈 <b>Upload started for: </b><code>{name}</code>\n⚠️ <i>Do not press the upload button again unless the upload has failed, you'll receive status updates on the same</i>"
+        upload_arg = {'hash': file_id} if prog == "qbit" else {'gid': file_id}
+        threading.Thread(target=upload_to_gdrive, kwargs=upload_arg, daemon=True).start()
+        logger.info(f"Upload thread started for: {name}")
+    await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
+
+async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await update.callback_query.answer()
         callback_data = update.callback_query.data.split("#", maxsplit=1)
@@ -431,6 +444,8 @@ async def aria_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 elif "remove" in action:
                     aria2c.remove(downloads=[aria_obj], force=True, files=True, clean=True)
                 await get_aria_downloads(update, context)
+            elif "upload" in action:
+                await trigger_upload(aria_obj.name, "aria", callback_data[1], update)
         elif "qbit" in action:
             torrent_hash = callback_data[1].strip() if len(callback_data) > 1 else None
             if qb_client := get_qbit_client():
@@ -450,14 +465,8 @@ async def aria_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
                         qb_client.torrents_delete(delete_files=True, torrent_hashes=[torrent_hash])
                     await get_aria_downloads(update, context)
                 elif "upload" in action:
-                    name = qb_client.torrents_info(torrent_hashes=[torrent_hash])[0].name
-                    if count_uploaded_files(file_name=name) > 0:
-                        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already uploaded</b> and can be found in {GDRIVE_FOLDER_BASE_URL.format(GDRIVE_FOLDER_ID)}"
-                    else:
-                        msg = f"🌈 <b>Upload started for: </b><code>{name}</code>\n⚠️ <i>Do not press the upload button again unless the upload has failed</i>"
-                        threading.Thread(target=upload_to_gdrive, kwargs={'hash': torrent_hash}, daemon=True).start()
-                        logger.info(f"Upload thread started for: {torrent_hash}")
-                    await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"qbit-file#{torrent_hash}")]]))
+                    name = qb_client.torrents_files(torrent_hash)[0].get('name').split("/")[0]
+                    await trigger_upload(name, "qbit", torrent_hash, update)
                 qb_client.auth_log_out()
         else:
             if "refresh" == callback_data[1]:
@@ -566,7 +575,7 @@ def start_bot() -> None:
             info_handler = CommandHandler(INFO_CMD, sys_info_handler, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             log_handler = CommandHandler(LOG_CMD, send_log_file, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             qbit_handler = CommandHandler(QBIT_CMD, qbit_upload, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
-            callback_handler = CallbackQueryHandler(aria_callback_handler, pattern="^aria|qbit|sys")
+            callback_handler = CallbackQueryHandler(bot_callback_handler, pattern="^aria|qbit|sys")
             application.add_handlers([start_handler, aria_handler, callback_handler, status_handler, info_handler, log_handler, qbit_handler])
             application.run_polling(drop_pending_updates=True)
         except error.TelegramError as err:
