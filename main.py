@@ -126,14 +126,14 @@ def get_oauth_creds():
 
 def count_uploaded_files(creds = None, folder_id: str = None, file_name: str = None) -> int:
     count = 0
-    if folder_id is not None:
-        logger.info(f"Getting the count of files present in {folder_id}")
-        query = f"mimeType != 'application/vnd.google-apps.folder' and trashed=false and parents in '{folder_id}'"
-    else:
-        logger.info(f"Searching for: {file_name}")
-        file_name = file_name.replace("'", "\\'")
-        query = f"fullText contains '{file_name}' and trashed=false and parents in '{GDRIVE_FOLDER_ID}'"
     try:
+        if folder_id is not None:
+            logger.info(f"Getting the count of files present in {folder_id}")
+            query = f"mimeType != 'application/vnd.google-apps.folder' and trashed=false and parents in '{folder_id}'"
+        else:
+            logger.info(f"Searching for: {file_name}")
+            file_name = file_name.replace("'", "\\'")
+            query = f"fullText contains '{file_name}' and trashed=false and parents in '{GDRIVE_FOLDER_ID}'"
         gdrive_service = build('drive', 'v3', credentials=creds if creds is not None else get_oauth_creds(), cache_discovery=False)
         files_list = gdrive_service.files().list(
             supportsAllDrives=True, includeItemsFromAllDrives=True, corpora='allDrives', q=query,
@@ -143,6 +143,16 @@ def count_uploaded_files(creds = None, folder_id: str = None, file_name: str = N
     except Exception:
         logger.error(f"Failed to get details of {folder_id}")
     return count
+
+def delete_empty_folder(folder_id: str, creds = None) -> None:
+    if folder_id and not count_uploaded_files(folder_id=folder_id):
+        logger.info(f"Deleting empty folder: {folder_id} in GDrive")
+        try:
+            gdrive_service = build('drive', 'v3', credentials=creds if creds is not None else get_oauth_creds(), cache_discovery=False)
+            gdrive_service.files().delete(fileId=folder_id, supportsAllDrives=True).execute()
+            gdrive_service.close()
+        except Exception:
+            logger.warning(f"Failed to delete folder: {folder_id}")
 
 def create_folder(folder_name: str, creds) -> Optional[str]:
     folder_id = None
@@ -246,6 +256,7 @@ def upload_to_gdrive(api: aria2p.API = None, gid: str = None, hash: str = None) 
         if count == count_uploaded_files(creds=creds, folder_id=folder_id):
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: </b><code>{GDRIVE_FOLDER_BASE_URL.format(folder_id)}</code>")
         else:
+            delete_empty_folder(folder_id)
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <i>Please check the log for more details using</i> <code>/{LOG_CMD}</code>")
 
 def get_user(update: Update) -> Union[str, int]:
