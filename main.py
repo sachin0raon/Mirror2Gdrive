@@ -16,7 +16,7 @@ from qbit_conf import QBIT_CONF
 from pyngrok import ngrok, conf
 from urllib.parse import quote
 from io import StringIO
-from typing import Union, Optional
+from typing import Union, Optional, Dict
 from dotenv import load_dotenv
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
 from telegram import Update, error, constants, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
@@ -300,44 +300,50 @@ def get_ngrok_btn(file_name: str) -> Optional[InlineKeyboardButton]:
         logger.error(f"Failed to get ngrok tunnel, error: {str(err)}")
         return None
 
-def get_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
-    refresh_btn = InlineKeyboardButton(text="♻ Refresh", callback_data=f"aria-refresh#{down.gid}")
-    delete_btn = InlineKeyboardButton(text="🚫 Delete", callback_data=f"aria-remove#{down.gid}")
-    show_all_btn = InlineKeyboardButton(text=f"🔆 Show All ({get_downloads_count()})", callback_data=f"aria-lists")
+def get_buttons(prog: str, dl_info: str) -> Dict[str, InlineKeyboardButton]:
+    return {
+        "refresh": InlineKeyboardButton(text="♻ Refresh", callback_data=f"{prog}-refresh#{dl_info}"),
+        "delete": InlineKeyboardButton(text="🚫 Delete", callback_data=f"{prog}-remove#{dl_info}"),
+        "retry": InlineKeyboardButton(text="🚀 Retry", callback_data=f"{prog}-retry#{dl_info}"),
+        "resume": InlineKeyboardButton(text="▶ Resume", callback_data=f"{prog}-resume#{dl_info}"),
+        "pause": InlineKeyboardButton(text="⏸ Pause", callback_data=f"{prog}-pause#{dl_info}"),
+        "upload": InlineKeyboardButton(text="☁️ Upload", callback_data=f"{prog}-upload#{dl_info}"),
+        "show_all": InlineKeyboardButton(text=f"🔆 Show All ({get_downloads_count()})", callback_data=f"{prog}-lists")
+    }
+
+def get_aria_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
+    buttons = get_buttons("aria", down.gid)
     ngrok_btn = get_ngrok_btn(down.name)
-    action_btn = [[show_all_btn, delete_btn]]
+    action_btn = [[buttons["show_all"], buttons["delete"]]]
     if "error" == down.status:
-        action_btn.insert(0, [refresh_btn, InlineKeyboardButton(text="🚀 Retry", callback_data=f"aria-retry#{down.gid}")])
+        action_btn.insert(0, [buttons["refresh"], buttons["retry"]])
     elif "paused" == down.status:
-        action_btn.insert(0, [refresh_btn, InlineKeyboardButton(text="▶ Resume", callback_data=f"aria-resume#{down.gid}")])
+        action_btn.insert(0, [buttons["refresh"], buttons["resume"]])
     elif "active" == down.status:
-        action_btn.insert(0, [refresh_btn, InlineKeyboardButton(text="⏸ Pause", callback_data=f"aria-pause#{down.gid}")])
+        action_btn.insert(0, [buttons["refresh"], buttons["pause"]])
     elif "complete" == down.status:
-        action_btn = [[ngrok_btn, delete_btn], [show_all_btn]] if ngrok_btn else [[show_all_btn, delete_btn]]
+        action_btn = [[ngrok_btn, buttons["delete"]], [buttons["show_all"]]] if ngrok_btn else [[buttons["show_all"], buttons["delete"]]]
     else:
-        action_btn = [[refresh_btn, delete_btn], [show_all_btn]]
+        action_btn = [[buttons["refresh"], buttons["delete"]], [buttons["show_all"]]]
     return InlineKeyboardMarkup(action_btn)
 
 def get_qbit_keyboard(qbit: qbittorrentapi.TorrentDictionary = None) -> InlineKeyboardMarkup:
-    refresh_btn = InlineKeyboardButton(text="♻ Refresh", callback_data=f"qbit-refresh#{qbit.hash}")
-    delete_btn = InlineKeyboardButton(text="🚫 Delete", callback_data=f"qbit-remove#{qbit.hash}")
-    show_all_btn = InlineKeyboardButton(text=f"🔆 Show All ({get_downloads_count()})", callback_data=f"qbit-lists")
-    upload_btn = InlineKeyboardButton(text="☁️ Upload", callback_data=f"qbit-upload#{qbit.hash}")
+    buttons = get_buttons("qbit", qbit.hash)
     ngrok_btn = get_ngrok_btn(qbit.files[0].get('name').split("/")[0])
-    action_btn = [[show_all_btn, delete_btn]]
+    action_btn = [[buttons["show_all"], buttons["delete"]]]
     if qbit.state_enum.is_errored:
-        action_btn.insert(0, [refresh_btn, InlineKeyboardButton(text="🚀 Retry", callback_data=f"qbit-retry#{qbit.hash}")])
+        action_btn.insert(0, [buttons["refresh"], buttons["retry"]])
     elif "pausedDL" == qbit.state_enum.value:
-        action_btn.insert(0, [refresh_btn, InlineKeyboardButton(text="▶ Resume", callback_data=f"qbit-resume#{qbit.hash}")])
+        action_btn.insert(0, [buttons["refresh"], buttons["resume"]])
     elif qbit.state_enum.is_downloading:
-        action_btn.insert(0, [refresh_btn, InlineKeyboardButton(text="⏸ Pause", callback_data=f"qbit-pause#{qbit.hash}")])
+        action_btn.insert(0, [buttons["refresh"], buttons["pause"]])
     elif qbit.state_enum.is_complete or "pausedUP" == qbit.state_enum.value:
         if ngrok_btn:
-            action_btn.insert(0, [ngrok_btn, upload_btn])
+            action_btn.insert(0, [ngrok_btn, buttons["upload"]])
         else:
-            action_btn = [[upload_btn, delete_btn], [show_all_btn]]
+            action_btn = [[buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
     else:
-        action_btn = [[refresh_btn, delete_btn], [show_all_btn]]
+        action_btn = [[buttons["refresh"], buttons["delete"]], [buttons["show_all"]]]
     return InlineKeyboardMarkup(action_btn)
 
 async def reply_message(msg: str, update: Update,
@@ -418,7 +424,7 @@ async def aria_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
                     aria2c.pause(downloads=[aria_obj], force=True)
                 elif "resume" in action:
                     aria2c.resume(downloads=[aria_obj])
-                await edit_message(get_download_info(aria_obj.live), update.callback_query, get_keyboard(aria_obj))
+                await edit_message(get_download_info(aria_obj.live), update.callback_query, get_aria_keyboard(aria_obj))
             elif action in ["aria-retry", "aria-remove", "aria-lists"]:
                 if "retry" in action:
                     aria2c.retry_downloads(downloads=[aria_obj], clean=False)
