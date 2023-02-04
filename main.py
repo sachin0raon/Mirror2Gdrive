@@ -16,6 +16,7 @@ from qbit_conf import QBIT_CONF
 from pyngrok import ngrok, conf
 from urllib.parse import quote
 from io import StringIO
+from asyncio import sleep
 from typing import Union, Optional, Dict
 from dotenv import load_dotenv
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
@@ -48,6 +49,7 @@ STATUS_CMD = "status"
 INFO_CMD = "info"
 LOG_CMD = "log"
 QBIT_CMD = "qbit"
+NGROK_CMD = "ngrok"
 GDRIVE_BASE_URL = "https://drive.google.com/uc?id={}&export=download"
 GDRIVE_FOLDER_BASE_URL = "https://drive.google.com/drive/folders/{}"
 TRACKER_URLS = [
@@ -59,7 +61,8 @@ ARIA_COMMAND = "aria2c --allow-overwrite=true --auto-file-renaming=true --check-
                "--force-save=true --http-accept-gzip=true --max-connection-per-server=16 --max-concurrent-downloads=10 "\
                "--max-file-not-found=0 --max-tries=20 --min-split-size=10M --optimize-concurrent-downloads=true --reuse-uri=true "\
                "--quiet=true --rpc-max-request-size=1024M --split=10 --summary-interval=0 --user-agent=Wget/1.12 --seed-time=0 "\
-               "--bt-enable-lpd=true --bt-detach-seed-only=true --bt-remove-unselected-file=true --follow-torrent=mem --bt-tracker={}"
+               "--bt-enable-lpd=true --bt-detach-seed-only=true --bt-remove-unselected-file=true --follow-torrent=mem --bt-tracker={} "\
+               "--keep-unfinished-download-result=true --save-not-found=true --save-session=/usr/src/app/aria2.session --save-session-interval=60"
 MAGNET_REGEX = r"magnet:\?xt=urn:btih:[a-zA-Z0-9]*"
 URL_REGEX = r"(?:(?:https?|ftp):\/\/)?[\w/\-?=%.]+\.[\w/\-?=%.]+"
 DOWNLOAD_PATH = "/usr/src/app/downloads"
@@ -215,6 +218,7 @@ def upload_to_gdrive(api: aria2p.API = None, gid: str = None, hash: str = None) 
     file_name = None
     logger.info("Download complete event triggered") if hash is None else logger.info(f"Uploading qbit file: {hash}")
     try:
+        aria2c.client.save_session()
         if hash is not None:
             if qb_client := get_qbit_client():
                 file_name = qb_client.torrents_files(torrent_hash=hash)[0].get('name').split("/")[0]
@@ -256,7 +260,7 @@ def upload_to_gdrive(api: aria2p.API = None, gid: str = None, hash: str = None) 
         if count == count_uploaded_files(creds=creds, folder_id=folder_id):
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: </b><code>{GDRIVE_FOLDER_BASE_URL.format(folder_id)}</code>")
         else:
-            delete_empty_folder(folder_id)
+            delete_empty_folder(folder_id, creds)
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <i>Please check the log for more details using</i> <code>/{LOG_CMD}</code>")
 
 def get_user(update: Update) -> Union[str, int]:
@@ -332,7 +336,7 @@ def get_aria_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
         action_btn.insert(0, [buttons["refresh"], buttons["resume"]])
     elif "active" == down.status:
         action_btn.insert(0, [buttons["refresh"], buttons["pause"]])
-    elif "complete" == down.status and down.is_metadata is False:
+    elif "complete" == down.status and down.is_metadata is False and not down.followed_by_ids:
         if ngrok_btn:
             action_btn = [[ngrok_btn, buttons["upload"]], [buttons["show_all"], buttons["delete"]]]
         else:
@@ -509,6 +513,25 @@ async def send_log_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except error.TelegramError:
         logger.error(f"Failed to send the log file to {get_user(update)}")
 
+async def ngrok_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Getting ngrok tunnel info")
+    try:
+        if tunnels := ngrok.get_tunnels():
+            await reply_message(f"🌐 <b>Ngrok URL:</b> {tunnels[0].public_url}", update, context)
+        else:
+            raise IndexError("No tunnel found")
+    except (IndexError, ngrok.PyngrokNgrokURLError, ngrok.PyngrokNgrokHTTPError) as err:
+        logger.error(f"Failed to get ngrok tunnel, error: {str(err)}")
+        logger.info("Restarting ngrok tunnel")
+        try:
+            if ngrok.process.is_process_running(conf.get_default().ngrok_path) is True:
+                ngrok.kill()
+                await sleep(1)
+            file_tunnel = ngrok.connect(addr=f"file://{DOWNLOAD_PATH}", proto="http", schemes=["http"], name="files_tunnel", inspect=False)
+            await reply_message(f"🌍 <b>Ngrok tunnel started\nURL:</b> {file_tunnel.public_url}", update, context)
+        except ngrok.PyngrokError as err:
+            await reply_message(f"⁉️ <b>Failed to get tunnel info</b>\nError: <code>{str(err)}</code>", update, context)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sender = get_user(update)
     logger.info(f"/{START_CMD} sent by {sender}")
@@ -519,6 +542,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
              (QBIT_CMD, "🧲 Mirror file using Qbittorrent"),
              (STATUS_CMD, "📥 Show the task list"),
              (INFO_CMD, "⚙️ Show system info"),
+             (NGROK_CMD, "🌍 Show Ngrok URL "),
              (LOG_CMD, "📄 Get runtime log file")]
         )
     except (error.TelegramError, RuntimeError):
@@ -547,6 +571,7 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             else:
                 logger.error(f"Failed to start download: {link} error: {aria_obj.error_code}")
                 await reply_message(f"⚠️ <b>Failed to start download</b>\nError:<code>{aria_obj.error_message}</code> ❗", update, context)
+        aria2c.client.save_session()
     except IndexError:
         await reply_message("😡 <b>Send a link along with the command</b>❗", update, context)
     except aria2p.ClientException:
@@ -586,8 +611,9 @@ def start_bot() -> None:
             info_handler = CommandHandler(INFO_CMD, sys_info_handler, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             log_handler = CommandHandler(LOG_CMD, send_log_file, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             qbit_handler = CommandHandler(QBIT_CMD, qbit_upload, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
+            ngrok_handler = CommandHandler(NGROK_CMD, ngrok_info, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             callback_handler = CallbackQueryHandler(bot_callback_handler, pattern="^aria|qbit|sys")
-            application.add_handlers([start_handler, aria_handler, callback_handler, status_handler, info_handler, log_handler, qbit_handler])
+            application.add_handlers([start_handler, aria_handler, callback_handler, status_handler, info_handler, log_handler, qbit_handler, ngrok_handler])
             application.run_polling(drop_pending_updates=True)
         except error.TelegramError as err:
             logger.error(f"Failed to start bot: {str(err)}")
