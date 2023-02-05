@@ -13,8 +13,11 @@ import subprocess
 import threading
 import qbittorrentapi
 from qbit_conf import QBIT_CONF
+from pyngrok import ngrok, conf
+from urllib.parse import quote
 from io import StringIO
-from typing import Union, Optional
+from asyncio import sleep
+from typing import Union, Optional, Dict
 from dotenv import load_dotenv
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
 from telegram import Update, error, constants, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
@@ -36,6 +39,7 @@ aria2c: aria2p.API = None
 CONFIG_FILE_URL = os.getenv("CONFIG_FILE_URL")
 BOT_START_TIME = None
 BOT_TOKEN = None
+NGROK_AUTH_TOKEN = None
 GDRIVE_FOLDER_ID = None
 AUTHORIZED_USERS = set()
 PICKLE_FILE_NAME = "token.pickle"
@@ -45,6 +49,7 @@ STATUS_CMD = "status"
 INFO_CMD = "info"
 LOG_CMD = "log"
 QBIT_CMD = "qbit"
+NGROK_CMD = "ngrok"
 GDRIVE_BASE_URL = "https://drive.google.com/uc?id={}&export=download"
 GDRIVE_FOLDER_BASE_URL = "https://drive.google.com/drive/folders/{}"
 TRACKER_URLS = [
@@ -56,7 +61,8 @@ ARIA_COMMAND = "aria2c --allow-overwrite=true --auto-file-renaming=true --check-
                "--force-save=true --http-accept-gzip=true --max-connection-per-server=16 --max-concurrent-downloads=10 "\
                "--max-file-not-found=0 --max-tries=20 --min-split-size=10M --optimize-concurrent-downloads=true --reuse-uri=true "\
                "--quiet=true --rpc-max-request-size=1024M --split=10 --summary-interval=0 --user-agent=Wget/1.12 --seed-time=0 "\
-               "--bt-enable-lpd=true --bt-detach-seed-only=true --bt-remove-unselected-file=true --follow-torrent=mem --bt-tracker={}"
+               "--bt-enable-lpd=true --bt-detach-seed-only=true --bt-remove-unselected-file=true --follow-torrent=mem --bt-tracker={} "\
+               "--keep-unfinished-download-result=true --save-not-found=true --save-session=/usr/src/app/aria2.session --save-session-interval=60"
 MAGNET_REGEX = r"magnet:\?xt=urn:btih:[a-zA-Z0-9]*"
 URL_REGEX = r"(?:(?:https?|ftp):\/\/)?[\w/\-?=%.]+\.[\w/\-?=%.]+"
 DOWNLOAD_PATH = "/usr/src/app/downloads"
@@ -123,14 +129,14 @@ def get_oauth_creds():
 
 def count_uploaded_files(creds = None, folder_id: str = None, file_name: str = None) -> int:
     count = 0
-    if folder_id is not None:
-        logger.info(f"Getting the count of files present in {folder_id}")
-        query = f"mimeType != 'application/vnd.google-apps.folder' and trashed=false and parents in '{folder_id}'"
-    else:
-        logger.info(f"Searching for: {file_name}")
-        file_name = file_name.replace("'", "\\'")
-        query = f"fullText contains '{file_name}' and trashed=false and parents in '{GDRIVE_FOLDER_ID}'"
     try:
+        if folder_id is not None:
+            logger.info(f"Getting the count of files present in {folder_id}")
+            query = f"mimeType != 'application/vnd.google-apps.folder' and trashed=false and parents in '{folder_id}'"
+        else:
+            logger.info(f"Searching for: {file_name}")
+            file_name = file_name.replace("'", "\\'")
+            query = f"fullText contains '{file_name}' and trashed=false and parents in '{GDRIVE_FOLDER_ID}'"
         gdrive_service = build('drive', 'v3', credentials=creds if creds is not None else get_oauth_creds(), cache_discovery=False)
         files_list = gdrive_service.files().list(
             supportsAllDrives=True, includeItemsFromAllDrives=True, corpora='allDrives', q=query,
@@ -140,6 +146,16 @@ def count_uploaded_files(creds = None, folder_id: str = None, file_name: str = N
     except Exception:
         logger.error(f"Failed to get details of {folder_id}")
     return count
+
+def delete_empty_folder(folder_id: str, creds = None) -> None:
+    if folder_id and not count_uploaded_files(folder_id=folder_id):
+        logger.info(f"Deleting empty folder: {folder_id} in GDrive")
+        try:
+            gdrive_service = build('drive', 'v3', credentials=creds if creds is not None else get_oauth_creds(), cache_discovery=False)
+            gdrive_service.files().delete(fileId=folder_id, supportsAllDrives=True).execute()
+            gdrive_service.close()
+        except Exception:
+            logger.warning(f"Failed to delete folder: {folder_id}")
 
 def create_folder(folder_name: str, creds) -> Optional[str]:
     folder_id = None
@@ -202,6 +218,7 @@ def upload_to_gdrive(api: aria2p.API = None, gid: str = None, hash: str = None) 
     file_name = None
     logger.info("Download complete event triggered") if hash is None else logger.info(f"Uploading qbit file: {hash}")
     try:
+        aria2c.client.save_session()
         if hash is not None:
             if qb_client := get_qbit_client():
                 file_name = qb_client.torrents_files(torrent_hash=hash)[0].get('name').split("/")[0]
@@ -243,6 +260,7 @@ def upload_to_gdrive(api: aria2p.API = None, gid: str = None, hash: str = None) 
         if count == count_uploaded_files(creds=creds, folder_id=folder_id):
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: </b><code>{GDRIVE_FOLDER_BASE_URL.format(folder_id)}</code>")
         else:
+            delete_empty_folder(folder_id, creds)
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <i>Please check the log for more details using</i> <code>/{LOG_CMD}</code>")
 
 def get_user(update: Update) -> Union[str, int]:
@@ -289,33 +307,62 @@ def get_downloads_count() -> int:
         logger.error("Failed to get total count of download tasks")
     return count
 
-def get_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
-    action_btn = [InlineKeyboardButton(text=f"🔆 Show All ({get_downloads_count()})", callback_data=f"aria-lists")]
-    if "error" in down.status:
-        action_btn.append(InlineKeyboardButton(text="🚀 Retry", callback_data=f"aria-retry#{down.gid}"))
-    elif "paused" in down.status:
-        action_btn.append(InlineKeyboardButton(text="▶ Resume", callback_data=f"aria-resume#{down.gid}"))
-    elif "active" in down.status:
-        action_btn.append(InlineKeyboardButton(text="⏸ Pause", callback_data=f"aria-pause#{down.gid}"))
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(text="♻ Refresh", callback_data=f"aria-refresh#{down.gid}"),
-          InlineKeyboardButton(text="🚫 Delete", callback_data=f"aria-remove#{down.gid}")], action_btn]
-    )
+def get_ngrok_btn(file_name: str) -> Optional[InlineKeyboardButton]:
+    try:
+        if tunnels := ngrok.get_tunnels():
+            return InlineKeyboardButton(text="🌐 Ngrok URL", url=f"{tunnels[0].public_url}/{quote(file_name)}")
+    except (IndexError, ngrok.PyngrokError) as err:
+        logger.error(f"Failed to get ngrok tunnel, error: {str(err)}")
+        return None
+
+def get_buttons(prog: str, dl_info: str) -> Dict[str, InlineKeyboardButton]:
+    return {
+        "refresh": InlineKeyboardButton(text="♻ Refresh", callback_data=f"{prog}-refresh#{dl_info}"),
+        "delete": InlineKeyboardButton(text="🚫 Delete", callback_data=f"{prog}-remove#{dl_info}"),
+        "retry": InlineKeyboardButton(text="🚀 Retry", callback_data=f"{prog}-retry#{dl_info}"),
+        "resume": InlineKeyboardButton(text="▶ Resume", callback_data=f"{prog}-resume#{dl_info}"),
+        "pause": InlineKeyboardButton(text="⏸ Pause", callback_data=f"{prog}-pause#{dl_info}"),
+        "upload": InlineKeyboardButton(text="☁️ Upload", callback_data=f"{prog}-upload#{dl_info}"),
+        "show_all": InlineKeyboardButton(text=f"🔆 Show All ({get_downloads_count()})", callback_data=f"{prog}-lists")
+    }
+
+def get_aria_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
+    buttons = get_buttons("aria", down.gid)
+    ngrok_btn = get_ngrok_btn(down.name)
+    action_btn = [[buttons["show_all"], buttons["delete"]]]
+    if "error" == down.status:
+        action_btn.insert(0, [buttons["refresh"], buttons["retry"]])
+    elif "paused" == down.status:
+        action_btn.insert(0, [buttons["refresh"], buttons["resume"]])
+    elif "active" == down.status:
+        action_btn.insert(0, [buttons["refresh"], buttons["pause"]])
+    elif "complete" == down.status and down.is_metadata is False and not down.followed_by_ids:
+        if ngrok_btn:
+            action_btn = [[ngrok_btn, buttons["upload"]], [buttons["show_all"], buttons["delete"]]]
+        else:
+            action_btn = [[buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
+    else:
+        action_btn = [[buttons["refresh"], buttons["delete"]], [buttons["show_all"]]]
+    return InlineKeyboardMarkup(action_btn)
 
 def get_qbit_keyboard(qbit: qbittorrentapi.TorrentDictionary = None) -> InlineKeyboardMarkup:
-    action_btn = [InlineKeyboardButton(text=f"🔆 Show All ({get_downloads_count()})", callback_data=f"qbit-lists")]
+    buttons = get_buttons("qbit", qbit.hash)
+    ngrok_btn = get_ngrok_btn(qbit.files[0].get('name').split("/")[0])
+    action_btn = [[buttons["show_all"], buttons["delete"]]]
     if qbit.state_enum.is_errored:
-        action_btn.append(InlineKeyboardButton(text="🚀 Retry", callback_data=f"qbit-retry#{qbit.hash}"))
+        action_btn.insert(0, [buttons["refresh"], buttons["retry"]])
     elif "pausedDL" == qbit.state_enum.value:
-        action_btn.append(InlineKeyboardButton(text="▶ Resume", callback_data=f"qbit-resume#{qbit.hash}"))
+        action_btn.insert(0, [buttons["refresh"], buttons["resume"]])
     elif qbit.state_enum.is_downloading:
-        action_btn.append(InlineKeyboardButton(text="⏸ Pause", callback_data=f"qbit-pause#{qbit.hash}"))
+        action_btn.insert(0, [buttons["refresh"], buttons["pause"]])
     elif qbit.state_enum.is_complete or "pausedUP" == qbit.state_enum.value:
-        action_btn.append(InlineKeyboardButton(text="☁️ Upload", callback_data=f"qbit-upload#{qbit.hash}"))
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(text="♻ Refresh", callback_data=f"qbit-refresh#{qbit.hash}"),
-          InlineKeyboardButton(text="🚫 Delete", callback_data=f"qbit-remove#{qbit.hash}")], action_btn]
-    )
+        if ngrok_btn:
+            action_btn.insert(0, [ngrok_btn, buttons["upload"]])
+        else:
+            action_btn = [[buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
+    else:
+        action_btn = [[buttons["refresh"], buttons["delete"]], [buttons["show_all"]]]
+    return InlineKeyboardMarkup(action_btn)
 
 async def reply_message(msg: str, update: Update,
                         context: ContextTypes.DEFAULT_TYPE,
@@ -341,7 +388,7 @@ async def edit_message(msg: str, callback: CallbackQuery, keyboard: InlineKeyboa
             reply_markup=keyboard
         )
     except error.TelegramError as err:
-        logger.error(f"Failed to edit message for: {callback.data} error: {str(err)}")
+        logger.debug(f"Failed to edit message for: {callback.data} error: {str(err)}")
 
 async def get_aria_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     file_btns = []
@@ -378,11 +425,22 @@ def get_sys_info() -> str:
               f"<b>Network IO:</b> 🔻 {humanize.naturalsize(psutil.net_io_counters().bytes_recv)} 🔺 {humanize.naturalsize(psutil.net_io_counters().bytes_sent)}"
     try:
         details += f"\n<b>Bot Uptime:</b> {humanize.naturaltime(time.time() - BOT_START_TIME)}"
-    except OverflowError:
+        details += f"\n<b>Ngrok URL:</b> {ngrok.get_tunnels()[0].public_url}"
+    except (OverflowError, IndexError, ngrok.PyngrokError):
         pass
     return details
 
-async def aria_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def trigger_upload(name: str, prog: str, file_id: str, update: Update) -> None:
+    if count_uploaded_files(file_name=name) > 0:
+        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already uploaded</b> and can be found in {GDRIVE_FOLDER_BASE_URL.format(GDRIVE_FOLDER_ID)}"
+    else:
+        msg = f"🌈 <b>Upload started for: </b><code>{name}</code>\n⚠️ <i>Do not press the upload button again unless the upload has failed, you'll receive status updates on the same</i>"
+        upload_arg = {'hash': file_id} if prog == "qbit" else {'gid': file_id}
+        threading.Thread(target=upload_to_gdrive, kwargs=upload_arg, daemon=True).start()
+        logger.info(f"Upload thread started for: {name}")
+    await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
+
+async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await update.callback_query.answer()
         callback_data = update.callback_query.data.split("#", maxsplit=1)
@@ -394,13 +452,15 @@ async def aria_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
                     aria2c.pause(downloads=[aria_obj], force=True)
                 elif "resume" in action:
                     aria2c.resume(downloads=[aria_obj])
-                await edit_message(get_download_info(aria_obj.live), update.callback_query, get_keyboard(aria_obj))
+                await edit_message(get_download_info(aria_obj.live), update.callback_query, get_aria_keyboard(aria_obj))
             elif action in ["aria-retry", "aria-remove", "aria-lists"]:
                 if "retry" in action:
                     aria2c.retry_downloads(downloads=[aria_obj], clean=False)
                 elif "remove" in action:
                     aria2c.remove(downloads=[aria_obj], force=True, files=True, clean=True)
                 await get_aria_downloads(update, context)
+            elif "upload" in action:
+                await trigger_upload(aria_obj.name, "aria", callback_data[1], update)
         elif "qbit" in action:
             torrent_hash = callback_data[1].strip() if len(callback_data) > 1 else None
             if qb_client := get_qbit_client():
@@ -420,14 +480,8 @@ async def aria_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
                         qb_client.torrents_delete(delete_files=True, torrent_hashes=[torrent_hash])
                     await get_aria_downloads(update, context)
                 elif "upload" in action:
-                    name = qb_client.torrents_info(torrent_hashes=[torrent_hash])[0].name
-                    if count_uploaded_files(file_name=name) > 0:
-                        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already uploaded</b> and can be found in {GDRIVE_FOLDER_BASE_URL.format(GDRIVE_FOLDER_ID)}"
-                    else:
-                        msg = f"🌈 <b>Upload started for: </b><code>{name}</code>\n⚠️ <i>Do not press the upload button again unless the upload has failed</i>"
-                        threading.Thread(target=upload_to_gdrive, kwargs={'hash': torrent_hash}, daemon=True).start()
-                        logger.info(f"Upload thread started for: {torrent_hash}")
-                    await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"qbit-file#{torrent_hash}")]]))
+                    name = qb_client.torrents_files(torrent_hash)[0].get('name').split("/")[0]
+                    await trigger_upload(name, "qbit", torrent_hash, update)
                 qb_client.auth_log_out()
         else:
             if "refresh" == callback_data[1]:
@@ -459,6 +513,25 @@ async def send_log_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except error.TelegramError:
         logger.error(f"Failed to send the log file to {get_user(update)}")
 
+async def ngrok_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Getting ngrok tunnel info")
+    try:
+        if tunnels := ngrok.get_tunnels():
+            await reply_message(f"🌐 <b>Ngrok URL:</b> {tunnels[0].public_url}", update, context)
+        else:
+            raise IndexError("No tunnel found")
+    except (IndexError, ngrok.PyngrokNgrokURLError, ngrok.PyngrokNgrokHTTPError) as err:
+        logger.error(f"Failed to get ngrok tunnel, error: {str(err)}")
+        logger.info("Restarting ngrok tunnel")
+        try:
+            if ngrok.process.is_process_running(conf.get_default().ngrok_path) is True:
+                ngrok.kill()
+                await sleep(1)
+            file_tunnel = ngrok.connect(addr=f"file://{DOWNLOAD_PATH}", proto="http", schemes=["http"], name="files_tunnel", inspect=False)
+            await reply_message(f"🌍 <b>Ngrok tunnel started\nURL:</b> {file_tunnel.public_url}", update, context)
+        except ngrok.PyngrokError as err:
+            await reply_message(f"⁉️ <b>Failed to get tunnel info</b>\nError: <code>{str(err)}</code>", update, context)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sender = get_user(update)
     logger.info(f"/{START_CMD} sent by {sender}")
@@ -469,6 +542,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
              (QBIT_CMD, "🧲 Mirror file using Qbittorrent"),
              (STATUS_CMD, "📥 Show the task list"),
              (INFO_CMD, "⚙️ Show system info"),
+             (NGROK_CMD, "🌍 Show Ngrok URL "),
              (LOG_CMD, "📄 Get runtime log file")]
         )
     except (error.TelegramError, RuntimeError):
@@ -497,6 +571,7 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             else:
                 logger.error(f"Failed to start download: {link} error: {aria_obj.error_code}")
                 await reply_message(f"⚠️ <b>Failed to start download</b>\nError:<code>{aria_obj.error_message}</code> ❗", update, context)
+        aria2c.client.save_session()
     except IndexError:
         await reply_message("😡 <b>Send a link along with the command</b>❗", update, context)
     except aria2p.ClientException:
@@ -536,8 +611,9 @@ def start_bot() -> None:
             info_handler = CommandHandler(INFO_CMD, sys_info_handler, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             log_handler = CommandHandler(LOG_CMD, send_log_file, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             qbit_handler = CommandHandler(QBIT_CMD, qbit_upload, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
-            callback_handler = CallbackQueryHandler(aria_callback_handler, pattern="^aria|qbit|sys")
-            application.add_handlers([start_handler, aria_handler, callback_handler, status_handler, info_handler, log_handler, qbit_handler])
+            ngrok_handler = CommandHandler(NGROK_CMD, ngrok_info, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
+            callback_handler = CallbackQueryHandler(bot_callback_handler, pattern="^aria|qbit|sys")
+            application.add_handlers([start_handler, aria_handler, callback_handler, status_handler, info_handler, log_handler, qbit_handler, ngrok_handler])
             application.run_polling(drop_pending_updates=True)
         except error.TelegramError as err:
             logger.error(f"Failed to start bot: {str(err)}")
@@ -599,10 +675,31 @@ def start_qbit() -> None:
         logger.error("Failed to start qbittorrent-nox")
         exit()
 
+def start_ngrok() -> None:
+    logger.info("Starting ngrok tunnel")
+    with open("/usr/src/app/ngrok.yml", "w") as config:
+        config.write(f"version: 2\nauthtoken: {NGROK_AUTH_TOKEN}\nregion: in\nconsole_ui: false\nlog_level: info")
+    ngrok_conf = conf.PyngrokConfig(
+        config_path="/usr/src/app/ngrok.yml",
+        auth_token=NGROK_AUTH_TOKEN,
+        region="in",
+        max_logs=5,
+        ngrok_version="v3",
+        monitor_thread=False)
+    try:
+        conf.set_default(ngrok_conf)
+        file_tunnel = ngrok.connect(addr=f"file://{DOWNLOAD_PATH}", proto="http", schemes=["http"], name="files_tunnel", inspect=False)
+        logger.info(f"Ngrok tunnel started: {file_tunnel.public_url}")
+    except ngrok.PyngrokError as err:
+        logger.error(f"Failed to start ngrok, error: {str(err)}")
+        exit()
+
 def setup_bot() -> None:
     global BOT_TOKEN
+    global NGROK_AUTH_TOKEN
     global GDRIVE_FOLDER_ID
     global AUTHORIZED_USERS
+    os.makedirs(name=DOWNLOAD_PATH, exist_ok=True)
     if CONFIG_FILE_URL is not None:
         logger.info("Downloading config file")
         try:
@@ -615,6 +712,7 @@ def setup_bot() -> None:
                 if load_dotenv(stream=StringIO(config_file.text), override=True):
                     config_file.close()
                     BOT_TOKEN = os.environ['BOT_TOKEN']
+                    NGROK_AUTH_TOKEN = os.environ['NGROK_AUTH_TOKEN']
                     GDRIVE_FOLDER_ID = os.environ['GDRIVE_FOLDER_ID']
                     try:
                         AUTHORIZED_USERS = json.loads(os.environ['USER_LIST'])
@@ -634,6 +732,7 @@ def setup_bot() -> None:
                                 logger.info("config.env data loaded successfully")
                                 start_aria()
                                 start_qbit()
+                                start_ngrok()
                                 start_bot()
                             else:
                                 logger.error("Failed to get pickle file data")

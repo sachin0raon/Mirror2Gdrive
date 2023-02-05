@@ -18,6 +18,8 @@ PICKLE_FILE_URL = ""
 BOT_TOKEN = ""
 USER_LIST = '[12345, 67890]'
 GDRIVE_FOLDER_ID = 'abcXYZ'
+# For serving download directories with ngrok's built-in file server
+NGROK_AUTH_TOKEN = ""
 ```
 
 ### Build and run the docker image
