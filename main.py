@@ -56,17 +56,19 @@ TRACKER_URLS = [
     "https://cdn.staticaly.com/gh/XIU2/TrackersListCollection/master/all_aria2.txt",
     "https://raw.githubusercontent.com/hezhijie0327/Trackerslist/main/trackerslist_tracker.txt"
 ]
+DHT_FILE_URL = "https://github.com/P3TERX/aria2.conf/raw/master/dht.dat"
+DHT6_FILE_URL = "https://github.com/P3TERX/aria2.conf/raw/master/dht6.dat"
 ARIA_COMMAND = "aria2c --allow-overwrite=true --auto-file-renaming=true --check-certificate=false --check-integrity=true "\
                "--continue=true --content-disposition-default-utf8=true --daemon=true --disk-cache=40M --enable-rpc=true "\
                "--force-save=true --http-accept-gzip=true --max-connection-per-server=16 --max-concurrent-downloads=10 "\
                "--max-file-not-found=0 --max-tries=20 --min-split-size=10M --optimize-concurrent-downloads=true --reuse-uri=true "\
-               "--quiet=true --rpc-max-request-size=1024M --split=10 --summary-interval=0 --user-agent=Wget/1.12 --seed-time=0 "\
-               "--bt-enable-lpd=true --bt-detach-seed-only=true --bt-remove-unselected-file=true --follow-torrent=mem --bt-tracker={} "\
+               "--quiet=true --rpc-max-request-size=1024M --split=10 --summary-interval=0 --seed-time=0 --bt-enable-lpd=true "\
+               "--bt-detach-seed-only=true --bt-remove-unselected-file=true --follow-torrent=mem --bt-tracker={} "\
                "--keep-unfinished-download-result=true --save-not-found=true --save-session=/usr/src/app/aria2.session --save-session-interval=60"
 MAGNET_REGEX = r"magnet:\?xt=urn:btih:[a-zA-Z0-9]*"
 URL_REGEX = r"(?:(?:https?|ftp):\/\/)?[\w/\-?=%.]+\.[\w/\-?=%.]+"
 DOWNLOAD_PATH = "/usr/src/app/downloads"
-ARIA_OPTS = {'dir': DOWNLOAD_PATH.rstrip("/"), 'max-upload-limit': '2M'}
+ARIA_OPTS = {'dir': DOWNLOAD_PATH.rstrip("/"), 'max-upload-limit': '3M'}
 GDRIVE_PERM = {
     'role': 'reader',
     'type': 'anyone',
@@ -646,15 +648,35 @@ def start_aria() -> None:
     global aria2c
     trackers = get_trackers()
     logger.info(f"Fetched {len(trackers.split(','))} trackers")
+    aria_command_args = ARIA_COMMAND.format(trackers).split(' ')
+    logger.info("Downloading dht files")
+    try:
+        dht_file = requests.get(url=DHT_FILE_URL)
+        if dht_file.ok:
+            with open("/usr/src/app/dht.dat", "wb") as f:
+                f.write(dht_file.content)
+            aria_command_args.extend(["--enable-dht=true", "--dht-file-path=/usr/src/app/dht.dat"])
+        dht6_file = requests.get(url=DHT6_FILE_URL)
+        if dht6_file.ok:
+            with open("/usr/src/app/dht6.dat", "wb") as f:
+                f.write(dht6_file.content)
+            aria_command_args.extend(["--enable-dht6=true", "--dht-file-path6=/usr/src/app/dht6.dat"])
+    except requests.exceptions.RequestException:
+        logger.warning("Failed to download dht file")
+    else:
+        dht_file.close()
+        dht6_file.close()
+    if os.path.exists("/usr/src/app/aria2.session"):
+        aria_command_args.append("--input-file=/usr/src/app/aria2.session")
     logger.info("Starting aria2c daemon")
-    aria_command_args = ARIA_COMMAND.format(f'"{trackers}"').split(' ')
     try:
         subprocess.run(args=aria_command_args, check=True)
         aria2c = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
         aria2c.listen_to_notifications(threaded=True, on_download_complete=upload_to_gdrive)
+        aria2c.get_downloads()
         logger.info("aria2c daemon started")
-    except (subprocess.CalledProcessError, aria2p.client.ClientException, requests.exceptions.RequestException, OSError):
-        logger.error("Failed to start aria2c")
+    except (subprocess.CalledProcessError, aria2p.client.ClientException, requests.exceptions.RequestException, OSError) as err:
+        logger.error(f"Failed to start aria2c, error: {str(err)}")
         exit()
 
 def start_qbit() -> None:
@@ -671,8 +693,8 @@ def start_qbit() -> None:
         qb_client = get_qbit_client()
         logger.info(f"qbittorrent version: {qb_client.app.version}")
         qb_client.auth_log_out()
-    except (subprocess.CalledProcessError, AttributeError):
-        logger.error("Failed to start qbittorrent-nox")
+    except (subprocess.CalledProcessError, AttributeError) as err:
+        logger.error(f"Failed to start qbittorrent-nox, error: {str(err)}")
         exit()
 
 def start_ngrok() -> None:
