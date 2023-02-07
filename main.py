@@ -441,9 +441,25 @@ async def get_total_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE
         await reply_message(msg, update, context, keyboard, False)
 
 def get_sys_info() -> str:
+    avg_cpu_temp = ""
+    if temp := psutil.sensors_temperatures():
+        if "coretemp" in temp:
+            key = "coretemp"
+        elif "cpu_thermal" in temp:
+            key = "cpu_thermal"
+        else:
+            key = None
+        if key:
+            cpu_temp = 0
+            for t in temp[key]:
+                cpu_temp += t.current
+            avg_cpu_temp += f"{round(number=cpu_temp/len(temp[key]), ndigits=2)}°C"
+    else:
+        avg_cpu_temp += "NA"
     details = f"<b>CPU Usage :</b> {psutil.cpu_percent(interval=None)}%\n" \
               f"<b>CPU Freq  :</b> {math.ceil(psutil.cpu_freq(percpu=False).current)} MHz\n" \
               f"<b>CPU Cores :</b> {psutil.cpu_count(logical=True)}\n" \
+              f"<b>CPU Temp  :</b> {avg_cpu_temp}\n" \
               f"<b>Total RAM :</b> {humanize.naturalsize(psutil.virtual_memory().total)}\n" \
               f"<b>Used RAM  :</b> {humanize.naturalsize(psutil.virtual_memory().used)}\n" \
               f"<b>Free RAM  :</b> {humanize.naturalsize(psutil.virtual_memory().available)}\n" \
