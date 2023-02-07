@@ -108,7 +108,7 @@ def send_status_update(msg: str) -> None:
     }
     for user_id in AUTHORIZED_USERS:
         payload = {
-            "text": msg.replace('<', '').replace('>', ''),
+            "text": msg,
             "parse_mode": "HTML",
             "disable_web_page_preview": False,
             "disable_notification": False,
@@ -526,7 +526,7 @@ async def start_extraction(name: str, prog: str, file_id: str, update: Update, u
                 threading.Thread(target=upload_to_gdrive, kwargs={'name': folder_name}, daemon=True).start()
         except patoolib.util.PatoolError as err:
             shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
-            send_status_update(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err)}</code>\n<i>Check /{LOG_CMD} for more details.</i>")
+            send_status_update(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n<i>Check /{LOG_CMD} for more details.</i>")
 
 def remove_extracted_dir(file_name: str) -> None:
     if is_archive_file(file_name) and os.path.exists(f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}"):
@@ -778,6 +778,7 @@ def start_aria() -> None:
     try:
         subprocess.run(args=aria_command_args, check=True)
         aria2c = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
+        time.sleep(2)
         if os.environ['ARIA_AUTO_UPLOAD'].lower() == "true":
             aria2c.listen_to_notifications(threaded=True, on_download_complete=upload_to_gdrive)
         aria2c.get_downloads()
