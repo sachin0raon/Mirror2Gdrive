@@ -371,7 +371,7 @@ def get_aria_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
 
 def get_qbit_keyboard(qbit: qbittorrentapi.TorrentDictionary = None) -> InlineKeyboardMarkup:
     buttons = get_buttons("qbit", qbit.hash)
-    file_name = qbit.files[0].get('name').split("/")[0]
+    file_name = qbit.files[0].get('name').split("/")[0] if qbit.files else qbit.get('name')
     ngrok_btn = get_ngrok_btn(file_name)
     action_btn = [[buttons["show_all"], buttons["delete"]]]
     if qbit.state_enum.is_errored:
@@ -567,7 +567,12 @@ async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         elif "qbit" in action:
             torrent_hash = callback_data[1].strip() if len(callback_data) > 1 else None
             if qb_client := get_qbit_client():
-                name = qb_client.torrents_files(torrent_hash)[0].get('name').split("/")[0] if torrent_hash else None
+                if torrent_hash is None:
+                    name = None
+                elif qb_client.torrents_files(torrent_hash):
+                    name = qb_client.torrents_files(torrent_hash)[0].get('name').split("/")[0]
+                else:
+                    name = qb_client.torrents_info(torrent_hashes=[torrent_hash])[0].get('name')
                 if action in ["qbit-refresh", "qbit-file", "qbit-pause", "qbit-resume"]:
                     if "pause" in action:
                         qb_client.torrents_pause(torrent_hashes=[torrent_hash])
