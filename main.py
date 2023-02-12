@@ -24,7 +24,7 @@ from asyncio import sleep
 from typing import Union, Optional, Dict
 from dotenv import load_dotenv
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
-from telegram import Update, error, constants, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from telegram import Update, error, constants, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Document
 from telegram.ext.filters import Chat
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, Application
 from google.auth.transport.requests import Request
@@ -41,12 +41,12 @@ logging.basicConfig(
 logging.getLogger("pyngrok.ngrok").setLevel(logging.ERROR)
 logging.getLogger("pyngrok.process").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
-aria2c: aria2p.API = None
+aria2c: Optional[aria2p.API] = None
 CONFIG_FILE_URL = os.getenv("CONFIG_FILE_URL")
-BOT_START_TIME = None
-BOT_TOKEN = None
-NGROK_AUTH_TOKEN = None
-GDRIVE_FOLDER_ID = None
+BOT_START_TIME: Optional[float] = None
+BOT_TOKEN: Optional[str] = None
+NGROK_AUTH_TOKEN: Optional[str] = None
+GDRIVE_FOLDER_ID: Optional[str] = None
 AUTHORIZED_USERS = set()
 PICKLE_FILE_NAME = "token.pickle"
 START_CMD = "start"
@@ -606,6 +606,8 @@ async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     await edit_message("<b>Sys info data cleared</b>", update.callback_query)
     except aria2p.ClientException:
         await edit_message(f"⁉️ <b>Unable to find GID:</b> <code>{update.callback_query.data}</code>", update.callback_query)
+    except qbittorrentapi.exceptions.APIError:
+        await edit_message(f"⁉️<b>Unable to find Torrent:</b> <code>{update.callback_query.data}</code>", update.callback_query)
     except (error.TelegramError, requests.exceptions.RequestException, IndexError, ValueError, RuntimeError):
         logger.error(f"Failed to answer callback for: {update.callback_query.data}")
 
@@ -665,43 +667,87 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update, context
     )
 
+async def is_torrent_file(doc: Document, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    logger.info(f"Fetching file: {doc.file_name}")
+    tg_file = await context.bot.get_file(file_id=doc.file_id)
+    tg_file_path = await tg_file.download_to_drive(custom_path=f"/tmp/{tg_file.file_id}")
+    if magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent":
+        return tg_file_path
+    else:
+        return None
+
 async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"/{MIRROR_CMD} sent by {get_user(update)}")
-    aria_obj: aria2p.Download = None
+    aria_obj: Optional[aria2p.Download] = None
+    link: Optional[str] = None
     try:
-        link = update.message.text.strip().split(" ", maxsplit=1)[1].strip()
-        if bool(re.findall(MAGNET_REGEX, link)) is True:
-            aria_obj = aria2c.add_magnet(magnet_uri=link, options=ARIA_OPTS)
-        elif bool(re.findall(URL_REGEX, link)) is True:
-            aria_obj = aria2c.add_uris(uris=[link], options=ARIA_OPTS)
+        if reply_msg := update.message.reply_to_message:
+            if reply_doc := reply_msg.document:
+                if file_path := await is_torrent_file(reply_doc, context):
+                    logger.info(f"Adding file to download: {reply_doc.file_name}")
+                    aria_obj = aria2c.add_torrent(torrent_file_path=file_path)
+                else:
+                    await reply_message(f"❗<b>Given file type not supported, please send a torrent file.</b>", update, context)
+            elif reply_text := reply_msg.text:
+                link = reply_text
+            else:
+                await reply_message(f"❗<b>Unsupported reply given, please reply with a torrent file or link.</b>", update, context)
         else:
-            logger.warning(f"Invalid link: {link}")
-            await reply_message("⁉️ <b>Invalid link given, please send a valid download link.</b>", update, context)
+            link = update.message.text.strip().split(" ", maxsplit=1)[1].strip()
+        if link is not None:
+            if bool(re.findall(MAGNET_REGEX, link)) is True:
+                aria_obj = aria2c.add_magnet(magnet_uri=link, options=ARIA_OPTS)
+            elif bool(re.findall(URL_REGEX, link)) is True:
+                aria_obj = aria2c.add_uris(uris=[link], options=ARIA_OPTS)
+            else:
+                logger.warning(f"Invalid link: {link}")
+                await reply_message("⁉️ <b>Invalid link given, please send a valid download link.</b>", update, context)
         if aria_obj is not None:
             if aria_obj.has_failed is False:
                 logger.info(f"Download started: {aria_obj.name} with GID: {aria_obj.gid}")
                 await reply_message(f"📥 <b>Download started</b> ✔️\n<i>Send /{STATUS_CMD} to view</i>", update, context)
             else:
-                logger.error(f"Failed to start download: {link} error: {aria_obj.error_code}")
+                logger.error(f"Failed to start download, error: {aria_obj.error_code}")
                 await reply_message(f"⚠️ <b>Failed to start download</b>\nError:<code>{aria_obj.error_message}</code> ❗", update, context)
         aria2c.client.save_session()
     except IndexError:
-        await reply_message("😡 <b>Send a link along with the command</b>❗", update, context)
+        await reply_message("😡 <b>Send a link along with the command or reply to it. You can also reply to a .torrent file</b>❗", update, context)
     except aria2p.ClientException:
         await reply_message("❗ <b>Failed to start download, kindly check the link and retry.</b>", update, context)
+    except error.TelegramError:
+        await reply_message("❗<b>Failed to process the given torrent file</b>", update, context)
 
 async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"/{QBIT_CMD} sent by {get_user(update)}")
+    link: Optional[str] = None
+    resp: Optional[str] = None
     if qb_client := get_qbit_client():
         try:
-            link = update.message.text.strip().split(" ", maxsplit=1)[1].strip()
-            resp = qb_client.torrents_add(urls=link)
-            if resp == "Ok.":
+            if reply_msg := update.message.reply_to_message:
+                if reply_doc := reply_msg.document:
+                    if file_path := await is_torrent_file(reply_doc, context):
+                        logger.info(f"Adding file to download: {reply_doc.file_name}")
+                        resp = qb_client.torrents_add(torrent_files=file_path)
+                    else:
+                        await reply_message(f"❗<b>Given file type not supported, please send a torrent file.</b>", update, context)
+                        return
+                elif reply_text := reply_msg.text:
+                    link = reply_text
+                else:
+                    await reply_message(f"❗<b>Unsupported reply given, please reply with a torrent file or link.</b>", update, context)
+                    return
+            else:
+                link = update.message.text.strip().split(" ", maxsplit=1)[1].strip()
+            if link is not None:
+                resp = qb_client.torrents_add(urls=link)
+            if resp is not None and resp == "Ok.":
                 await reply_message(f"🧲 <b>Torrent added</b> ✔️\n<i>Send /{STATUS_CMD} to view</i>", update, context)
             else:
                 await reply_message("❗ <b>Failed to add it</b>\n⚠️ <i>Kindly verify the given link and retry</i>", update, context)
         except IndexError:
-            await reply_message("😡 <b>Send a link along with the command</b>❗", update, context)
+            await reply_message("😡 <b>Send a link along with the command or reply to it. You can also reply to a .torrent file</b>❗", update, context)
+        except error.TelegramError:
+            await reply_message("❗<b>Failed to process the given torrent file</b>", update, context)
         finally:
             qb_client.auth_log_out()
     else:
@@ -806,7 +852,8 @@ def start_qbit() -> None:
         qb_client = get_qbit_client()
         logger.info(f"qbittorrent version: {qb_client.app.version}")
         qb_client.auth_log_out()
-    except (subprocess.CalledProcessError, AttributeError) as err:
+    except (subprocess.CalledProcessError, AttributeError, qbittorrentapi.exceptions.APIConnectionError,
+            qbittorrentapi.exceptions.LoginFailed) as err:
         logger.error(f"Failed to start qbittorrent-nox, error: {str(err)}")
         exit()
 
