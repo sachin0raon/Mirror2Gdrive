@@ -48,6 +48,8 @@ BOT_TOKEN: Optional[str] = None
 NGROK_AUTH_TOKEN: Optional[str] = None
 GDRIVE_FOLDER_ID: Optional[str] = None
 AUTHORIZED_USERS = set()
+QBIT_STATUS_DICT = dict()
+UPLOAD_MODE_DICT = dict()
 PICKLE_FILE_NAME = "token.pickle"
 START_CMD = "start"
 MIRROR_CMD = "aria"
@@ -222,7 +224,7 @@ def is_archive_file(file_name: str) -> bool:
     else:
         return False
 
-def upload_to_gdrive(api: aria2p.API = None, gid: str = None, hash: str = None, name: str = None) -> None:
+def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> None:
     count = 0
     creds = None
     folder_id = None
@@ -291,11 +293,11 @@ def get_download_info(down: aria2p.Download) -> str:
     if down.bittorrent is not None:
         info += f"\n🥑 <b>Seeders:</b> <code>{down.num_seeders}</code>"
     info += f"\n⚙️ <b>Engine: </b><code>Aria2</code>\n📚 <b>Total Files:</b> <code>{len(down.files)}</code>\n"
-    if len(down.files) > 1:
-        for aria_file in down.files:
-            if aria_file.is_metadata is True:
-                continue
-            info += f"📄 {os.path.basename(aria_file.path.name)} <code>[{aria_file.completed_length_string()}/{aria_file.length_string()}]</code>\n"
+    # if len(down.files) > 1:
+    #     for aria_file in down.files:
+    #         if aria_file.is_metadata is True:
+    #             continue
+    #         info += f"📄 {os.path.basename(aria_file.path.name)} <code>[{aria_file.completed_length_string()}/{aria_file.length_string()}]</code>\n"
     return info
 
 def get_qbit_info(hash: str, client: qbittorrentapi.Client = None) -> str:
@@ -307,9 +309,9 @@ def get_qbit_info(hash: str, client: qbittorrentapi.Client = None) -> str:
             f"⏳ <b>ETA:</b> <code>{humanize.naturaldelta(torrent.eta)}</code>\n⚙️ <b>Engine: </b><code>Qbittorent</code>"
         try:
             info += f"\n📚 <b>Total Files:</b> <code>{len(client.torrents_files(torrent_hash=hash))}</code>\n"
-            if len(client.torrents_files(torrent_hash=hash)) > 1:
-                for torrent_file in client.torrents_files(torrent_hash=hash):
-                    info += f"📄 {os.path.basename(torrent_file.get('name'))} <code>[{round(number=torrent_file.get('progress') * 100, ndigits=1)}%|{humanize.naturalsize(torrent_file.get('size'))}]</code>\n"
+            # if len(client.torrents_files(torrent_hash=hash)) > 1:
+            #     for torrent_file in client.torrents_files(torrent_hash=hash):
+            #         info += f"📄 {os.path.basename(torrent_file.get('name'))} <code>[{round(number=torrent_file.get('progress') * 100, ndigits=1)}%|{humanize.naturalsize(torrent_file.get('size'))}]</code>\n"
         except qbittorrentapi.exceptions.NotFound404Error:
             pass
     return info
@@ -681,6 +683,8 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     aria_obj: Optional[aria2p.Download] = None
     link: Optional[str] = None
     try:
+        cmd_txt = update.message.text.strip().split(" ", maxsplit=1)
+        upload_mode = "M" if len(cmd_txt) > 1 and re.search("^-M", cmd_txt[1], re.IGNORECASE) else "A"
         if reply_msg := update.message.reply_to_message:
             if reply_doc := reply_msg.document:
                 if file_path := await is_torrent_file(reply_doc, context):
@@ -693,7 +697,7 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             else:
                 await reply_message(f"❗<b>Unsupported reply given, please reply with a torrent file or link.</b>", update, context)
         else:
-            link = update.message.text.strip().split(" ", maxsplit=1)[1].strip()
+            link = cmd_txt[1][2: len(cmd_txt[1])].strip() if upload_mode == "M" else cmd_txt[1].strip()
         if link is not None:
             if bool(re.findall(MAGNET_REGEX, link)) is True:
                 aria_obj = aria2c.add_magnet(magnet_uri=link, options=ARIA_OPTS)
@@ -705,13 +709,14 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if aria_obj is not None:
             if aria_obj.has_failed is False:
                 logger.info(f"Download started: {aria_obj.name} with GID: {aria_obj.gid}")
+                UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
                 await reply_message(f"📥 <b>Download started</b> ✔️\n<i>Send /{STATUS_CMD} to view</i>", update, context)
             else:
                 logger.error(f"Failed to start download, error: {aria_obj.error_code}")
                 await reply_message(f"⚠️ <b>Failed to start download</b>\nError:<code>{aria_obj.error_message}</code> ❗", update, context)
         aria2c.client.save_session()
     except IndexError:
-        await reply_message("😡 <b>Send a link along with the command or reply to it. You can also reply to a .torrent file</b>❗", update, context)
+        await reply_message(f"😡 <b>Send a link along with the command or reply to it. You can also reply to a .torrent file</b>❗\n<i>Send /{MIRROR_CMD} -m to disable auto upload</i>", update, context)
     except aria2p.ClientException:
         await reply_message("❗ <b>Failed to start download, kindly check the link and retry.</b>", update, context)
     except error.TelegramError:
@@ -723,6 +728,8 @@ async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     resp: Optional[str] = None
     if qb_client := get_qbit_client():
         try:
+            cmd_txt = update.message.text.strip().split(" ", maxsplit=1)
+            upload_mode = "M" if len(cmd_txt) > 1 and re.search("^-M", cmd_txt[1], re.IGNORECASE) else "A"
             if reply_msg := update.message.reply_to_message:
                 if reply_doc := reply_msg.document:
                     if file_path := await is_torrent_file(reply_doc, context):
@@ -737,21 +744,72 @@ async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     await reply_message(f"❗<b>Unsupported reply given, please reply with a torrent file or link.</b>", update, context)
                     return
             else:
-                link = update.message.text.strip().split(" ", maxsplit=1)[1].strip()
+                link = cmd_txt[1][2: len(cmd_txt[1])].strip() if upload_mode == "M" else cmd_txt[1].strip()
             if link is not None:
                 resp = qb_client.torrents_add(urls=link)
             if resp is not None and resp == "Ok.":
                 await reply_message(f"🧲 <b>Torrent added</b> ✔️\n<i>Send /{STATUS_CMD} to view</i>", update, context)
+                for torrent in qb_client.torrents_info(status_filter='all', sort='added_on', reverse=True, limit=1):
+                    UPLOAD_MODE_DICT[torrent.get('hash')] = upload_mode
             else:
                 await reply_message("❗ <b>Failed to add it</b>\n⚠️ <i>Kindly verify the given link and retry</i>", update, context)
         except IndexError:
-            await reply_message("😡 <b>Send a link along with the command or reply to it. You can also reply to a .torrent file</b>❗", update, context)
+            await reply_message(f"😡 <b>Send a link along with the command or reply to it. You can also reply to a .torrent file</b>❗\n<i>Send /{QBIT_CMD} -m to disable auto upload</i>", update, context)
         except error.TelegramError:
             await reply_message("❗<b>Failed to process the given torrent file</b>", update, context)
         finally:
             qb_client.auth_log_out()
     else:
         await reply_message("⁉️ <b>Error connecting to qbittorrent, please retry</b>", update, context)
+
+def aria_listener(api: aria2p.API = None, gid: str = None) -> None:
+    logger.info("aria download complete event trigger")
+    try:
+        down = aria2c.get_download(gid)
+        if not down.is_metadata and not down.followed_by_ids:
+            msg = f"✅ <b>Downloaded: </b><code>{down.name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(down.total_length)}</code>"
+            if tunnel := ngrok.get_tunnels():
+                msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(down.name)}"
+            send_status_update(msg)
+            if gid in UPLOAD_MODE_DICT and UPLOAD_MODE_DICT.get(gid) == "A":
+                upload_to_gdrive(gid)
+        else:
+            for fgid in down.followed_by_ids:
+                UPLOAD_MODE_DICT[fgid] = UPLOAD_MODE_DICT.get(gid) if gid in UPLOAD_MODE_DICT else "M"
+            logger.info(f"Removing file: {down.name}")
+            aria2c.remove(downloads=[down])
+    except aria2p.ClientException as err:
+        logger.error(f"Error in aria listener: {str(err)}")
+
+def qbit_listener() -> None:
+    logger.info("Starting qbit download event listener")
+    while True:
+        if qb_client := get_qbit_client():
+            for torrent in qb_client.torrents_info(status_filter="all"):
+                present_in_dict = torrent.get('hash') in QBIT_STATUS_DICT
+                if torrent.state_enum.is_complete or "pausedUP" == torrent.state_enum.value:
+                    if present_in_dict:
+                        if QBIT_STATUS_DICT.get(torrent.get('hash')) == "NOT_SENT":
+                            msg = f"✅ <b>Downloaded: </b><code>{torrent.get('name')}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(torrent.get('size'))}</code>\n" \
+                                  f"⏳ <b>Time taken: </b><code>{humanize.naturaldelta(torrent.get('completion_on') - torrent.get('added_on'))}</code>"
+                            if tunnel := ngrok.get_tunnels():
+                                file_name = torrent.files[0].get('name').split("/")[0] if torrent.files else torrent.get('name')
+                                msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(file_name)}"
+                            send_status_update(msg)
+                            QBIT_STATUS_DICT[torrent.get('hash')] = "SENT"
+                            if torrent.get('hash') in UPLOAD_MODE_DICT and UPLOAD_MODE_DICT.get(torrent.get('hash')) == "A":
+                                upload_to_gdrive(hash=torrent.get('hash'))
+                    else:
+                        QBIT_STATUS_DICT[torrent.get('hash')] = "NOT_SENT"
+                if torrent.state_enum.is_errored:
+                    if present_in_dict:
+                        if QBIT_STATUS_DICT.get(torrent.get('hash')) == "NOT_SENT":
+                            send_status_update(f"❌ <b>Failed: </b><code>{torrent.get('name')}</code>")
+                            QBIT_STATUS_DICT[torrent.get('hash')] = "SENT"
+                    else:
+                        QBIT_STATUS_DICT[torrent.get('hash')] = "NOT_SENT"
+            qb_client.auth_log_out()
+        time.sleep(10)
 
 def start_bot() -> None:
     global BOT_START_TIME
@@ -828,10 +886,9 @@ def start_aria() -> None:
     logger.info("Starting aria2c daemon")
     try:
         subprocess.run(args=aria_command_args, check=True)
-        aria2c = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
         time.sleep(2)
-        if os.environ['ARIA_AUTO_UPLOAD'].lower() == "true":
-            aria2c.listen_to_notifications(threaded=True, on_download_complete=upload_to_gdrive)
+        aria2c = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
+        aria2c.listen_to_notifications(threaded=True, on_download_complete=aria_listener)
         aria2c.get_downloads()
         logger.info("aria2c daemon started")
     except (subprocess.CalledProcessError, aria2p.client.ClientException, requests.exceptions.RequestException, OSError) as err:
@@ -852,6 +909,7 @@ def start_qbit() -> None:
         qb_client = get_qbit_client()
         logger.info(f"qbittorrent version: {qb_client.app.version}")
         qb_client.auth_log_out()
+        threading.Thread(target=qbit_listener, daemon=False).start()
     except (subprocess.CalledProcessError, AttributeError, qbittorrentapi.exceptions.APIConnectionError,
             qbittorrentapi.exceptions.LoginFailed) as err:
         logger.error(f"Failed to start qbittorrent-nox, error: {str(err)}")

@@ -21,8 +21,6 @@ USER_LIST = '[12345, 67890]'
 GDRIVE_FOLDER_ID = 'abcXYZ'
 # For serving download directory with ngrok's built-in file server
 NGROK_AUTH_TOKEN = ""
-# To prevent auto uploading of files downloaded by aria
-ARIA_AUTO_UPLOAD = False
 ```
 
 ### Build and run the docker image
