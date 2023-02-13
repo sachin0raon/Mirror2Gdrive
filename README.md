@@ -21,6 +21,8 @@ USER_LIST = '[12345, 67890]'
 GDRIVE_FOLDER_ID = 'abcXYZ'
 # For serving download directory with ngrok's built-in file server
 NGROK_AUTH_TOKEN = ""
+# For clearing tasks whose upload is completed
+AUTO_DEL_TASK = False
 ```
 
 ### Build and run the docker image

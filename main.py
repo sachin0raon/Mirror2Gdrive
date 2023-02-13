@@ -47,6 +47,7 @@ BOT_START_TIME: Optional[float] = None
 BOT_TOKEN: Optional[str] = None
 NGROK_AUTH_TOKEN: Optional[str] = None
 GDRIVE_FOLDER_ID: Optional[str] = None
+AUTO_DEL_TASK: Optional[bool] = None
 AUTHORIZED_USERS = set()
 QBIT_STATUS_DICT = dict()
 UPLOAD_MODE_DICT = dict()
@@ -167,6 +168,28 @@ def delete_empty_folder(folder_id: str, creds = None) -> None:
         except Exception:
             logger.warning(f"Failed to delete folder: {folder_id}")
 
+def remove_extracted_dir(file_name: str) -> None:
+    if is_archive_file(file_name) and os.path.exists(f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}"):
+        shutil.rmtree(path=f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}", ignore_errors=True)
+
+def clear_task_files(task_id: str, is_qbit: bool) -> None:
+    file_name = None
+    logger.info(f"Removing task: {task_id}")
+    try:
+        if is_qbit is True:
+            if qb_client := get_qbit_client():
+                qbit = qb_client.torrents_info(torrent_hashes=[task_id])[0]
+                file_name = qbit.files[0].get('name').split("/")[0] if qbit.files else qbit.get('name')
+                qb_client.torrents_delete(delete_files=True, torrent_hashes=[task_id])
+                qb_client.auth_log_out()
+        else:
+            down = aria2c.get_download(gid=task_id)
+            file_name = down.name
+            aria2c.remove(downloads=[down], force=False, files=True, clean=True)
+        remove_extracted_dir(file_name) if file_name else logger.warning("Unable to get file name")
+    except Exception as err:
+        logger.error(f"Failed to remove, error: {str(err)}")
+
 def create_folder(folder_name: str, creds) -> Optional[str]:
     folder_id = None
     logger.info(f"Creating folder: {folder_name} in GDrive")
@@ -187,7 +210,7 @@ def create_folder(folder_name: str, creds) -> Optional[str]:
     return folder_id
 
 @retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=(retry_if_exception_type(Exception)))
-def upload_file(file_path: str, folder_id: str, creds) -> None:
+def upload_file(file_path: str, folder_id: str, creds, task_data: str = None) -> None:
     file_name = os.path.basename(file_path)
     file_metadata = {'name': file_name, 'parents': [folder_id]}
     logger.info(f"Starting upload: {file_name}")
@@ -217,6 +240,10 @@ def upload_file(file_path: str, folder_id: str, creds) -> None:
         pass
     if folder_id == GDRIVE_FOLDER_ID:
         send_status_update(f"🗂️ <b>File:</b> <code>{file_name}</code> uploaded ✔️\n🌐 <b>Link:</b> {GDRIVE_BASE_URL.format(drive_file.get('id'))}")
+        if task_data:
+            task_d = task_data.split(sep="#", maxsplit=1)
+            task_id = task_d[1]
+            clear_task_files(task_id, True if task_d[0] == "qbit" else False)
 
 def is_archive_file(file_name: str) -> bool:
     if os.path.isfile(f"{DOWNLOAD_PATH}/{file_name}"):
@@ -230,13 +257,16 @@ def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Non
     folder_id = None
     is_dir = False
     file_name = None
+    task_id: Optional[str] = None
     try:
         aria2c.client.save_session()
         if hash is not None:
+            task_id = f"qbit#{hash}"
             if qb_client := get_qbit_client():
                 file_name = qb_client.torrents_files(torrent_hash=hash)[0].get('name').split("/")[0]
                 qb_client.auth_log_out()
         elif gid is not None:
+            task_id = f"aria#{gid}"
             down = aria2c.get_download(gid)
             file_name = down.name
             if down.followed_by_ids or down.is_metadata:
@@ -262,7 +292,7 @@ def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Non
                                 count += 1
                                 upload_file(os.path.join(path, f), folder_id, creds)
                 else:
-                    upload_file(file_path, GDRIVE_FOLDER_ID, creds)
+                    upload_file(file_path, GDRIVE_FOLDER_ID, creds, task_id)
     except RetryError as err:
         if isinstance(err.last_attempt.exception(), HttpError):
             reason = str(err.last_attempt.exception().error_details)
@@ -279,6 +309,11 @@ def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Non
     if is_dir is True:
         if count == count_uploaded_files(creds=creds, folder_id=folder_id):
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: </b>{GDRIVE_FOLDER_BASE_URL.format(folder_id)}")
+            if AUTO_DEL_TASK:
+                if gid is not None:
+                    clear_task_files(gid, False)
+                if hash is not None:
+                    clear_task_files(hash, True)
         else:
             delete_empty_folder(folder_id, creds)
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <i>Please check the log for more details using</i> <code>/{LOG_CMD}</code>")
@@ -529,10 +564,6 @@ async def start_extraction(name: str, prog: str, file_id: str, update: Update, u
         except patoolib.util.PatoolError as err:
             shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
             send_status_update(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n<i>Check /{LOG_CMD} for more details.</i>")
-
-def remove_extracted_dir(file_name: str) -> None:
-    if is_archive_file(file_name) and os.path.exists(f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}"):
-        shutil.rmtree(path=f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}", ignore_errors=True)
 
 async def upext_handler(file_name: str, prog: str, file_id: str, update: Update) -> None:
     if is_file_extracted(file_name):
@@ -932,13 +963,13 @@ def start_ngrok() -> None:
         logger.info(f"Ngrok tunnel started: {file_tunnel.public_url}")
     except ngrok.PyngrokError as err:
         logger.error(f"Failed to start ngrok, error: {str(err)}")
-        exit()
 
 def setup_bot() -> None:
     global BOT_TOKEN
     global NGROK_AUTH_TOKEN
     global GDRIVE_FOLDER_ID
     global AUTHORIZED_USERS
+    global AUTO_DEL_TASK
     os.makedirs(name=DOWNLOAD_PATH, exist_ok=True)
     if CONFIG_FILE_URL is not None:
         logger.info("Downloading config file")
@@ -954,6 +985,7 @@ def setup_bot() -> None:
                     BOT_TOKEN = os.environ['BOT_TOKEN']
                     NGROK_AUTH_TOKEN = os.environ['NGROK_AUTH_TOKEN']
                     GDRIVE_FOLDER_ID = os.environ['GDRIVE_FOLDER_ID']
+                    AUTO_DEL_TASK = os.getenv(key='AUTO_DEL_TASK', default="True").lower() == "true"
                     try:
                         AUTHORIZED_USERS = json.loads(os.environ['USER_LIST'])
                     except json.JSONDecodeError:
