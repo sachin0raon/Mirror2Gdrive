@@ -3,13 +3,13 @@ Hello there, 👽 I am a Telegram Bot that can download files using Aria2/Qbitto
 
 ### Available Commands
 ```sh
-👽 Start the bot -> /start
-🗳 Mirror file using Aria2 -> /aria
-🧲 Mirror file using Qbittorrent -> /qbit
-📥 Show the task list -> /status
-🌍 Show Ngrok URL -> /ngrok
-⚙️ Show system info -> /info
-📄 Get runtime log file -> /log
+start - 👽 Start the bot
+aria - 🗳 Mirror file using Aria2
+qbit - 🧲 Mirror file using Qbittorrent
+status - 📥 Show the task
+ngrok - 🌍 Show Ngrok URL
+info - ⚙️ Show system info
+log - 📄 Get runtime log file
 ```
 
 ### Prepare config.env file
