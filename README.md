@@ -8,6 +8,9 @@ aria    - 🗳 Mirror file using Aria2
 qbit    - 🧲 Mirror file using Qbittorrent
 unzipar - 🗃️ Mirror & unzip using Aria2
 unzipqb - 🫧 Mirror & unzip using Qbittorrent
+leechar - 🧩 Mirror & leech using Aria2
+leechqb - 🌀 Mirror and leech using Qbittorrent
+unziple - 🧬 Unzip and leech
 status  - 📥 Show the task
 ngrok   - 🌍 Show Ngrok URL
 info    - ⚙️ Show system info
@@ -19,7 +22,13 @@ Create an env file in [Github Gist](https://gist.github.com/) or any other place
 ```sh
 PICKLE_FILE_URL = ""
 BOT_TOKEN = ""
+TG_API_ID = ""
+TG_API_HASH = ""
+# To upload files in telegram
+USER_SESSION_STRING = ""
+# Authorized users to use the bot
 USER_LIST = '[12345, 67890]'
+# Drive/Folder ID to upload files
 GDRIVE_FOLDER_ID = 'abcXYZ'
 # For serving download directory with ngrok's built-in file server
 NGROK_AUTH_TOKEN = ""

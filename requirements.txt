@@ -9,3 +9,5 @@ qbittorrent-api==2022.11.40
 pyngrok==5.2.1
 patool==1.12
 python-magic==0.4.27
+pyrogram==2.0.99
+tgCrypto==1.2.5
