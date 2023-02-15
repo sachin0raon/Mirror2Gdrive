@@ -21,10 +21,10 @@ from pyngrok import ngrok, conf
 from urllib.parse import quote
 from io import StringIO
 from asyncio import sleep
-from typing import Union, Optional, Dict, List
+from typing import Union, Optional, Dict, List, Tuple
 from dotenv import load_dotenv
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
-from telegram import Update, error, constants, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Document
+from telegram import Update, error, constants, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Document, Message
 from telegram.ext.filters import Chat
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, Application
 from google.auth.transport.requests import Request
@@ -444,9 +444,9 @@ def get_qbit_keyboard(qbit: qbittorrentapi.TorrentDictionary = None) -> InlineKe
 
 async def reply_message(msg: str, update: Update,
                         context: ContextTypes.DEFAULT_TYPE,
-                        keyboard: InlineKeyboardMarkup = None, reply: bool = True) -> None:
+                        keyboard: InlineKeyboardMarkup = None, reply: bool = True) -> Optional[Message]:
     try:
-        await context.bot.send_message(
+        return await context.bot.send_message(
             text=msg,
             chat_id=update.message.chat_id,
             reply_to_message_id=update.message.id if reply is True else None,
@@ -716,6 +716,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update, context
     )
 
+async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[Optional[str], Optional[Message]]:
+    logger.info(f"Fetching file: {doc.file_name}")
+    tg_msg: Optional[Message] = None
+    tg_file_path: Optional[str] = None
+    if doc.file_size >= 10485760:
+        tg_msg = await reply_message(f"<b>File: </b><code>{doc.file_name}</code> <b>is being downloaded, please wait</b>", update, context)
+    try:
+        tg_file = await context.bot.get_file(file_id=doc.file_id)
+        tg_file_path = await tg_file.download_to_drive(custom_path=f"/tmp/{doc.file_id}")
+    except error.TelegramError:
+        logger.error(f"Failed to download {doc.file_name}, retrying with pyrogram")
+        try:
+            if pyro_app is not None:
+                tg_file_path = await pyro_app.download_media(message=doc.file_id, file_name=f"/tmp/{doc.file_id}")
+        except errors.RPCError as err:
+            logger.error(f"Failed to download {doc.file_name} [{err.ID}]")
+        except ValueError:
+            logger.error(f"Given file: {doc.file_name} does not exist in telegram server")
+        else:
+            if tg_file_path is not None and os.path.exists(tg_file_path):
+                if tg_msg is not None:
+                    tg_msg = await context.bot.edit_message_text(
+                        text=f"<b>File: </b><code>{doc.file_name}</code> <b>is downloaded, starting further process</b>",
+                        chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML
+                    )
+    return tg_file_path, tg_msg
+
+def extract_upload_tg_file(file_path: str, upload: bool = True) -> None:
+    if os.path.exists(file_path) is False or os.path.isdir(file_path) is True:
+        return
+    name = os.path.basename(file_path)
+    folder_name = os.path.splitext(name)[0]
+    os.makedirs(name=f"{DOWNLOAD_PATH}/{folder_name}", exist_ok=True)
+    try:
+        patoolib.extract_archive(archive=file_path, outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
+        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️"
+        send_status_update(msg)
+        if upload is True and upload_to_gdrive(name=folder_name) is True:
+            logger.info(f"Cleaning up: {name}")
+            shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
+            os.remove(file_path)
+    except patoolib.util.PatoolError as err:
+        shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
+        send_status_update(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n<i>Check /{LOG_CMD} for more details.</i>")
+
 async def is_torrent_file(doc: Document, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
     logger.info(f"Fetching file: {doc.file_name}")
     tg_file = await context.bot.get_file(file_id=doc.file_id)
@@ -748,15 +793,28 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
             upload_mode = "A"
         if reply_msg := update.message.reply_to_message:
             if reply_doc := reply_msg.document:
-                if file_path := await is_torrent_file(reply_doc, context):
+                tg_file_path, tg_msg = await get_tg_file(reply_doc, update, context)
+                if tg_file_path is None:
+                    _msg = "❗<b>Failed to download file, please check log for more details</b>"
+                    if tg_msg is not None:
+                        await context.bot.edit_message_text(text=_msg, chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML)
+                    else:
+                        await reply_message(_msg, update, context)
+                elif magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent":
                     logger.info(f"Adding file to download: {reply_doc.file_name}")
-                    aria_obj = aria2c.add_torrent(torrent_file_path=file_path)
+                    aria_obj = aria2c.add_torrent(torrent_file_path=tg_file_path)
+                elif magic.from_file(tg_file_path, mime=True) in ArchiveMimetypes:
+                    if tg_msg is not None:
+                        await context.bot.edit_message_text(text=f"<b>File: </b><code>{reply_doc.file_name}</code> <b>extraction started</b>",
+                                                            chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML)
+                    shutil.move(src=tg_file_path, dst=f"{DOWNLOAD_PATH}/{reply_doc.file_name}")
+                    threading.Thread(target=extract_upload_tg_file, args=(f"{DOWNLOAD_PATH}/{reply_doc.file_name}",), daemon=True).start()
                 else:
-                    await reply_message(f"❗<b>Given file type not supported, please send a torrent file.</b>", update, context)
+                    await reply_message(f"❗<b>Given file type not supported, please send a torrent/archive file.</b>", update, context)
             elif reply_text := reply_msg.text:
                 link = reply_text
             else:
-                await reply_message(f"❗<b>Unsupported reply given, please reply with a torrent file or link.</b>", update, context)
+                await reply_message(f"❗<b>Unsupported reply given, please reply with a torrent/link/archive file.</b>", update, context)
         else:
             link = cmd_txt[1][2: len(cmd_txt[1])].strip() if "M" in upload_mode else cmd_txt[1].strip()
         if link is not None:
@@ -783,7 +841,7 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
     except aria2p.ClientException:
         await reply_message("❗ <b>Failed to start download, kindly check the link and retry.</b>", update, context)
     except error.TelegramError:
-        await reply_message("❗<b>Failed to process the given torrent file</b>", update, context)
+        await reply_message("❗<b>Failed to process the given file</b>", update, context)
 
 async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip: bool = False, leech: bool = False) -> None:
     logger.info(f"/{QBIT_CMD if not unzip else UNZIP_QBIT_CMD} sent by {get_user(update)}")
