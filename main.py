@@ -331,6 +331,58 @@ def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Opt
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <i>Please check the log for more details using</i> <code>/{LOG_CMD}</code>")
             return False
 
+@retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=(retry_if_exception_type(errors.RPCError)))
+def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.InputMediaDocument]] = None) -> None:
+    file_name = os.path.basename(file_path)
+    user_id = LEECH_CHAT_DICT[file_id] if file_id in LEECH_CHAT_DICT else None
+    if pyro_app is None:
+        send_status_update(f"⚠️ <b>Skip upload: </b><code>{file_name}</code>\n<b>Reason: </b>Pyrogram session is not initialized", user_id)
+        return
+    try:
+        if media_list is None:
+            if shutil.disk_usage(file_path).used == 0:
+                logger.warning(f"Skip upload: {file_name}, reason: empty file")
+            else:
+                pyro_app.send_document(chat_id=user_id if user_id is not None else "self", document=file_path, file_name=file_name,
+                                       disable_notification=True, protect_content=False)
+                logger.info(f"Tg upload completed: {file_name}")
+        else:
+            pyro_app.send_media_group(chat_id=user_id if user_id is not None else "self", media=media_list,
+                                      disable_notification=True, protect_content=False)
+            logger.info(f"Tg upload completed, total item: {len(media_list)} in: {file_name}")
+    except errors.FloodWait as err:
+        logger.warning(f"Error: {err.ID}")
+        sleep(err.value)
+    except errors.RPCError as err:
+        logger.error(f"Upload failed: {file_name} [{err.ID}]")
+        raise err
+
+def trigger_tg_upload(down_path: str, task_id: str) -> None:
+    file_name = os.path.basename(down_path)
+    try:
+        if os.path.isdir(down_path):
+            files_list = []
+            for address, dirs, files in os.walk(down_path):
+                files_list.extend([os.path.join(address, file) for file in files
+                                   if shutil.disk_usage(os.path.join(address, file)).used > 0])
+            if files_list and len(files_list) < 2:
+                upload_to_tg(task_id, files_list[0])
+            else:
+                files_chunk = [files_list[i:i+10] for i in range(0, len(files_list), 10)]
+                for chunk in files_chunk:
+                    logger.info(f"Tg Upload started, total item: {len(chunk)} in {file_name}")
+                    upload_to_tg(task_id, file_name, [types.InputMediaDocument(media=file) for file in chunk])
+        else:
+            logger.info(f"Tg Upload started: {file_name}")
+            upload_to_tg(task_id, down_path)
+    except RetryError as err:
+        logger.error(f"Tg Upload failed: {file_name}, attempts: {err.last_attempt.attempt_number}")
+        send_status_update(f"❗<b>Upload failed: </b><code>{file_name}</code>\n<i>Check log for more details</i>",
+                           LEECH_CHAT_DICT[task_id] if task_id in LEECH_CHAT_DICT else None)
+    else:
+        logger.info(f"Cleaning up: {file_name}")
+        shutil.rmtree(path=down_path, ignore_errors=True)
+
 def get_user(update: Update) -> Union[str, int]:
     return update.message.from_user.name if update.message.from_user.name is not None else update.message.chat_id
 
@@ -743,7 +795,7 @@ async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAU
                     )
     return tg_file_path, tg_msg
 
-def extract_upload_tg_file(file_path: str, upload: bool = True) -> None:
+def extract_upload_tg_file(file_path: str, upload: bool = False, leech: bool = False, task_id: str = "") -> None:
     if os.path.exists(file_path) is False or os.path.isdir(file_path) is True:
         return
     name = os.path.basename(file_path)
@@ -752,11 +804,16 @@ def extract_upload_tg_file(file_path: str, upload: bool = True) -> None:
     try:
         patoolib.extract_archive(archive=file_path, outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
         msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️"
+        if not upload and not leech:
+            if tunnel := ngrok.get_tunnels():
+                msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(folder_name)}"
         send_status_update(msg)
         if upload is True and upload_to_gdrive(name=folder_name) is True:
             logger.info(f"Cleaning up: {name}")
             shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
             os.remove(file_path)
+        if leech is True:
+            trigger_tg_upload(f"{DOWNLOAD_PATH}/{folder_name}", task_id)
     except patoolib.util.PatoolError as err:
         shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
         send_status_update(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n<i>Check /{LOG_CMD} for more details.</i>")
@@ -765,10 +822,7 @@ async def is_torrent_file(doc: Document, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.info(f"Fetching file: {doc.file_name}")
     tg_file = await context.bot.get_file(file_id=doc.file_id)
     tg_file_path = await tg_file.download_to_drive(custom_path=f"/tmp/{tg_file.file_id}")
-    if magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent":
-        return tg_file_path
-    else:
-        return None
+    return tg_file_path if magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent" else None
 
 async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip: bool = False, leech: bool = False) -> None:
     logger.info(f"/{MIRROR_CMD if not unzip else UNZIP_ARIA_CMD} sent by {get_user(update)}")
@@ -804,11 +858,21 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
                     logger.info(f"Adding file to download: {reply_doc.file_name}")
                     aria_obj = aria2c.add_torrent(torrent_file_path=tg_file_path)
                 elif magic.from_file(tg_file_path, mime=True) in ArchiveMimetypes:
+                    file_path = f"{DOWNLOAD_PATH}/{reply_doc.file_name}"
                     if tg_msg is not None:
                         await context.bot.edit_message_text(text=f"<b>File: </b><code>{reply_doc.file_name}</code> <b>extraction started</b>",
                                                             chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML)
-                    shutil.move(src=tg_file_path, dst=f"{DOWNLOAD_PATH}/{reply_doc.file_name}")
-                    threading.Thread(target=extract_upload_tg_file, args=(f"{DOWNLOAD_PATH}/{reply_doc.file_name}",), daemon=True).start()
+                    shutil.move(src=tg_file_path, dst=file_path)
+                    if "L" in upload_mode:
+                        up_args = {"upload": False, "leech": True}
+                    elif "M" in upload_mode:
+                        up_args = {"upload": False, "leech": False}
+                    else:
+                        up_args = {"upload": True, "leech": False}
+                    up_args["file_path"] = file_path
+                    up_args["task_id"] = reply_doc.file_id
+                    LEECH_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
+                    threading.Thread(target=extract_upload_tg_file, kwargs=up_args, daemon=True).start()
                 else:
                     await reply_message(f"❗<b>Given file type not supported, please send a torrent/archive file.</b>", update, context)
             elif reply_text := reply_msg.text:
@@ -914,55 +978,6 @@ async def qbit_mirror_leech(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def aria_unzip_leech(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await aria_upload(update, context, True, True)
-
-@retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=(retry_if_exception_type(errors.RPCError)))
-def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.InputMediaDocument]] = None) -> None:
-    file_name = os.path.basename(file_path)
-    user_id = LEECH_CHAT_DICT[file_id] if file_id in LEECH_CHAT_DICT else None
-    if pyro_app is None:
-        send_status_update(f"⚠️ <b>Skip upload: </b><code>{file_name}</code>\n<b>Reason: </b>Pyrogram session is not initialized", user_id)
-        return
-    try:
-        if media_list is None:
-            if shutil.disk_usage(file_path).used == 0:
-                logger.warning(f"Skip upload: {file_name}, reason: empty file")
-            else:
-                pyro_app.send_document(chat_id=user_id if user_id is not None else "self", document=file_path, file_name=file_name,
-                                       disable_notification=True, protect_content=False)
-                logger.info(f"Tg upload completed: {file_name}")
-        else:
-            pyro_app.send_media_group(chat_id=user_id if user_id is not None else "self", media=media_list,
-                                      disable_notification=True, protect_content=False)
-            logger.info(f"Tg upload completed, total item: {len(media_list)} in: {file_name}")
-    except errors.FloodWait as err:
-        logger.warning(f"Error: {err.ID}")
-        sleep(err.value)
-    except errors.RPCError as err:
-        logger.error(f"Upload failed: {file_name} [{err.ID}]")
-        raise err
-
-def trigger_tg_upload(down_path: str, task_id: str) -> None:
-    file_name = os.path.basename(down_path)
-    try:
-        if os.path.isdir(down_path):
-            files_list = []
-            for address, dirs, files in os.walk(down_path):
-                files_list.extend([os.path.join(address, file) for file in files
-                                   if shutil.disk_usage(os.path.join(address, file)).used > 0])
-            if files_list and len(files_list) < 2:
-                upload_to_tg(task_id, files_list[0])
-            else:
-                files_chunk = [files_list[i:i+10] for i in range(0, len(files_list), 10)]
-                for chunk in files_chunk:
-                    logger.info(f"Tg Upload started, total item: {len(chunk)} in {file_name}")
-                    upload_to_tg(task_id, file_name, [types.InputMediaDocument(media=file) for file in chunk])
-        else:
-            logger.info(f"Tg Upload started: {file_name}")
-            upload_to_tg(task_id, down_path)
-    except RetryError as err:
-        logger.error(f"Tg Upload failed: {file_name}, attempts: {err.last_attempt.attempt_number}")
-        send_status_update(f"❗<b>Upload failed: </b><code>{file_name}</code>\n<i>Check log for more details</i>",
-                           LEECH_CHAT_DICT[task_id] if task_id in LEECH_CHAT_DICT else None)
 
 def extract_and_upload(torrent: Union[aria2p.Download, qbittorrentapi.TorrentDictionary], upload: bool = True, leech: bool = False) -> None:
     if isinstance(torrent, qbittorrentapi.TorrentDictionary):
@@ -1083,7 +1098,7 @@ def start_bot() -> None:
             unzip_qbit = CommandHandler(UNZIP_QBIT_CMD, qbit_unzip_upload, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             leech_aria = CommandHandler(LEECH_ARIA_CMD, aria_mirror_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             leech_qbit = CommandHandler(LEECH_QBIT_CMD, qbit_mirror_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
-            unzip_leech_aria = CommandHandler(UNZIP_LEECH_CMD, aria_unzip_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
+            unzip_leech_aria = CommandHandler(UNZIP_LEECH_CMD, aria_unzip_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False), block=False)
             callback_handler = CallbackQueryHandler(bot_callback_handler, pattern="^aria|qbit|sys")
             application.add_handlers([start_handler, aria_handler, callback_handler, status_handler, info_handler, log_handler,
                                       qbit_handler, ngrok_handler, unzip_aria, unzip_qbit, leech_aria, leech_qbit, unzip_leech_aria])
