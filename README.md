@@ -3,18 +3,18 @@ Hello there, 👽 I am a Telegram Bot that can download files using Aria2/Qbitto
 
 ### Available Commands
 ```sh
-start   - 👽 Start the bot
-mirror    - 🗳 Mirror file using Aria2
-qbmirror   - 🧲 Mirror file using Qbittorrent
-unzipmirror - 🗃️ Mirror & unzip using Aria2
+start         - 👽 Start the bot
+mirror        - 🗳 Mirror file using Aria2
+qbmirror      - 🧲 Mirror file using Qbittorrent
+unzipmirror   - 🗃️ Mirror & unzip using Aria2
 qbunzipmirror - 🫧 Mirror & unzip using Qbittorrent
-leech - 🧩 Mirror & leech using Aria2
-qbleech - 🌀 Mirror and leech using Qbittorrent
-unzipleech - 🧬 Unzip and leech
-status  - 📥 Show the task
-ngrok   - 🌍 Show Ngrok URL
-stats    - ⚙️ Show system info
-log     - 📄 Get runtime log file
+leech         - 🧩 Mirror & leech using Aria2
+qbleech       - 🌀 Mirror and leech using Qbittorrent
+unzipleech    - 🧬 Unzip and leech
+status        - 📥 Show the task
+ngrok         - 🌍 Show Ngrok URL
+stats         - ⚙️ Show system info
+log           - 📄 Get runtime log file
 ```
 
 ### Prepare config.env file

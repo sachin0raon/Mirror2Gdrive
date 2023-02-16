@@ -11,3 +11,4 @@ patool==1.12
 python-magic==0.4.27
 pyrogram==2.0.99
 tgCrypto==1.2.5
+natsort==8.2.0
