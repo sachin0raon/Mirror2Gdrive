@@ -10,7 +10,7 @@ unzipmirror - 🗃️ Mirror & unzip using Aria2
 qbunzipmirror - 🫧 Mirror & unzip using Qbittorrent
 leech - 🧩 Mirror & leech using Aria2
 qbleech - 🌀 Mirror and leech using Qbittorrent
-unziplech - 🧬 Unzip and leech
+unzipleech - 🧬 Unzip and leech
 status  - 📥 Show the task
 ngrok   - 🌍 Show Ngrok URL
 stats    - ⚙️ Show system info
