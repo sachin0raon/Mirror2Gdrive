@@ -28,7 +28,7 @@ from io import StringIO
 from asyncio import sleep
 from typing import Union, Optional, Dict, List, Tuple
 from dotenv import load_dotenv
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError, Retrying
 from telegram import Update, error, constants, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Document, Message
 from telegram.ext.filters import Chat
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, Application
@@ -211,11 +211,17 @@ def create_folder(folder_name: str, creds) -> Optional[str]:
     logger.info(f"Creating folder: {folder_name} in GDrive")
     dir_metadata = {'name': folder_name, 'parents': [GDRIVE_FOLDER_ID], 'mimeType': 'application/vnd.google-apps.folder'}
     try:
-        gdrive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
-        upload_dir = gdrive_service.files().create(body=dir_metadata, supportsAllDrives=True, fields='id').execute()
-        folder_id = upload_dir.get('id')
-    except Exception as err:
-        logger.error(f"Failed to create dir: {folder_name} error: {str(err)}")
+        for attempt in Retrying(wait=wait_exponential(multiplier=2, min=4, max=8), stop=stop_after_attempt(2), retry=retry_if_exception_type(Exception)):
+            with attempt:
+                gdrive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+                upload_dir = gdrive_service.files().create(body=dir_metadata, supportsAllDrives=True, fields='id').execute()
+                folder_id = upload_dir.get('id')
+    except RetryError as err:
+        last_err = err.last_attempt.exception()
+        err_msg = f"⚠️ <b>Upload failed: </b><code>{folder_name}</code> <b>error in creating folder</b>\n<b>Reason: </b><code>{last_err.error_details}" +\
+                  f"[{last_err.status_code}]</code>" if isinstance(last_err, HttpError) else f"<code>{str(last_err)}</code>"
+        logger.error(f"Failed to create folder: {folder_name} [attempts: {err.last_attempt.attempt_number}]")
+        send_status_update(err_msg)
     else:
         logger.info(f"Setting permissions for: {folder_name}")
         try:
@@ -322,7 +328,7 @@ def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Opt
         logger.error("Failed to complete download event task")
     except qbittorrentapi.exceptions.NotFound404Error:
         logger.error("Failed to get torrent hash info")
-    if is_dir is True:
+    if is_dir is True and folder_id is not None:
         if count == count_uploaded_files(creds=creds, folder_id=folder_id):
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: </b>{GDRIVE_FOLDER_BASE_URL.format(folder_id)}")
             if AUTO_DEL_TASK:
