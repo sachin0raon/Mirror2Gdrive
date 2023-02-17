@@ -3,15 +3,18 @@ Hello there, 👽 I am a Telegram Bot that can download files using Aria2/Qbitto
 
 ### Available Commands
 ```sh
-start   - 👽 Start the bot
-aria    - 🗳 Mirror file using Aria2
-qbit    - 🧲 Mirror file using Qbittorrent
-unzipar - 🗃️ Mirror & unzip using Aria2
-unzipqb - 🫧 Mirror & unzip using Qbittorrent
-status  - 📥 Show the task
-ngrok   - 🌍 Show Ngrok URL
-info    - ⚙️ Show system info
-log     - 📄 Get runtime log file
+start         - 👽 Start the bot
+mirror        - 🗳 Mirror file using Aria2
+qbmirror      - 🧲 Mirror file using Qbittorrent
+unzipmirror   - 🗃️ Mirror & unzip using Aria2
+qbunzipmirror - 🫧 Mirror & unzip using Qbittorrent
+leech         - 🧩 Mirror & leech using Aria2
+qbleech       - 🌀 Mirror and leech using Qbittorrent
+unzipleech    - 🧬 Unzip and leech
+status        - 📥 Show the task
+ngrok         - 🌍 Show Ngrok URL
+stats         - ⚙️ Show system info
+log           - 📄 Get runtime log file
 ```
 
 ### Prepare config.env file
@@ -19,7 +22,13 @@ Create an env file in [Github Gist](https://gist.github.com/) or any other place
 ```sh
 PICKLE_FILE_URL = ""
 BOT_TOKEN = ""
+TG_API_ID = ""
+TG_API_HASH = ""
+# To upload files in telegram
+USER_SESSION_STRING = ""
+# Authorized users to use the bot
 USER_LIST = '[12345, 67890]'
+# Drive/Folder ID to upload files
 GDRIVE_FOLDER_ID = 'abcXYZ'
 # For serving download directory with ngrok's built-in file server
 NGROK_AUTH_TOKEN = ""
