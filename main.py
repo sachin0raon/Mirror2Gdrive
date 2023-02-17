@@ -13,9 +13,13 @@ import subprocess
 import threading
 import shutil
 import magic
+import ffmpeg
 import patoolib
 import qbittorrentapi
 from natsort import natsorted
+from PIL import Image, UnidentifiedImageError
+from ffprobe import FFProbe
+from ffprobe.exceptions import FFProbeError
 from patoolib import ArchiveMimetypes
 from qbit_conf import QBIT_CONF
 from pyngrok import ngrok, conf
@@ -24,7 +28,7 @@ from io import StringIO
 from asyncio import sleep
 from typing import Union, Optional, Dict, List, Tuple
 from dotenv import load_dotenv
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError, Retrying
 from telegram import Update, error, constants, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Document, Message
 from telegram.ext.filters import Chat
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, Application
@@ -207,11 +211,17 @@ def create_folder(folder_name: str, creds) -> Optional[str]:
     logger.info(f"Creating folder: {folder_name} in GDrive")
     dir_metadata = {'name': folder_name, 'parents': [GDRIVE_FOLDER_ID], 'mimeType': 'application/vnd.google-apps.folder'}
     try:
-        gdrive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
-        upload_dir = gdrive_service.files().create(body=dir_metadata, supportsAllDrives=True, fields='id').execute()
-        folder_id = upload_dir.get('id')
-    except Exception as err:
-        logger.error(f"Failed to create dir: {folder_name} error: {str(err)}")
+        for attempt in Retrying(wait=wait_exponential(multiplier=2, min=4, max=8), stop=stop_after_attempt(2), retry=retry_if_exception_type(Exception)):
+            with attempt:
+                gdrive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+                upload_dir = gdrive_service.files().create(body=dir_metadata, supportsAllDrives=True, fields='id').execute()
+                folder_id = upload_dir.get('id')
+    except RetryError as err:
+        last_err = err.last_attempt.exception()
+        err_msg = f"⚠️ <b>Upload failed: </b><code>{folder_name}</code> <b>error in creating folder</b>\n<b>Reason: </b><code>{last_err.error_details}" +\
+                  f"[{last_err.status_code}]</code>" if isinstance(last_err, HttpError) else f"<code>{str(last_err)}</code>"
+        logger.error(f"Failed to create folder: {folder_name} [attempts: {err.last_attempt.attempt_number}]")
+        send_status_update(err_msg)
     else:
         logger.info(f"Setting permissions for: {folder_name}")
         try:
@@ -318,7 +328,7 @@ def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Opt
         logger.error("Failed to complete download event task")
     except qbittorrentapi.exceptions.NotFound404Error:
         logger.error("Failed to get torrent hash info")
-    if is_dir is True:
+    if is_dir is True and folder_id is not None:
         if count == count_uploaded_files(creds=creds, folder_id=folder_id):
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: </b>{GDRIVE_FOLDER_BASE_URL.format(folder_id)}")
             if AUTO_DEL_TASK:
@@ -334,7 +344,7 @@ def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Opt
 
 @retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=(retry_if_exception_type(errors.RPCError)))
 def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.InputMediaDocument]] = None,
-                 is_audio: bool = False, is_video: bool = False, is_photo: bool = False) -> None:
+                 is_audio: bool = False, is_video: bool = False, is_photo: bool = False, thumb: str = None) -> None:
     file_name = os.path.basename(file_path)
     user_id = LEECH_CHAT_DICT[file_id] if file_id in LEECH_CHAT_DICT else None
     if pyro_app is None:
@@ -350,12 +360,13 @@ def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.I
                                 file_name=file_name, disable_notification=True, protect_content=False)
         elif is_video:
             pyro_app.send_video(chat_id=user_id, video=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                file_name=file_name, supports_streaming=True, disable_notification=True, protect_content=False)
+                                file_name=file_name, thumb=thumb, supports_streaming=True, disable_notification=True, protect_content=False)
         elif is_photo:
             pyro_app.send_photo(chat_id=user_id, photo=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
                                 disable_notification=True, protect_content=False)
         else:
-            pyro_app.send_document(chat_id=user_id, document=file_path, file_name=file_name, disable_notification=True, protect_content=False)
+            pyro_app.send_document(chat_id=user_id, document=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
+                                   file_name=file_name, disable_notification=True, protect_content=False)
         logger.info(f"Tg Upload completed: {file_name} [Total items: {len(media_list)}]") if media_list else logger.info(f"Tg Upload completed: {file_name}")
     except (ValueError, FileNotFoundError) as err:
         logger.error(f"Tg Upload failed: {file_name} [{str(err)}]")
@@ -365,6 +376,32 @@ def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.I
     except errors.RPCError as err:
         logger.error(f"Tg Upload failed: {file_name} [{err.ID}]")
         raise err
+
+def get_file_thumb(file_path: str) -> Optional[str]:
+    name, ext = os.path.splitext(os.path.basename(file_path))
+    out_file = f"/tmp/{name}_thumb.jpg"
+    duration = 0
+    is_video = False
+    try:
+        for stream in FFProbe(file_path).streams:
+            if stream.is_video():
+                is_video = True
+                try:
+                    duration = stream.duration_seconds()
+                except FFProbeError:
+                    pass
+                break
+        if duration == 0 and is_video is False:
+            logger.warning(f"Unable to get thumb: {name}, reason: duration is 0")
+        else:
+            ffmpeg_proc = ffmpeg.input(file_path, ss=duration // 2 if duration >= 4 else 3).output(out_file, vframes=1).run_async(quiet=True)
+            ffmpeg_out, _ = ffmpeg_proc.communicate()
+            if os.path.exists(out_file):
+                with Image.open(out_file) as img:
+                    img.resize(size=(320, 320)).convert(mode="RGB").save(out_file, "JPEG")
+                return out_file
+    except (FFProbeError, ffmpeg.Error, UnidentifiedImageError, ValueError, TypeError, OSError) as err:
+        logger.warning(f"Failed to get thumb for {name}{ext}[{str(err)}]")
 
 def get_file_type(file_path: str) -> Tuple[bool, bool, bool]:
     is_audio = is_video = is_photo = False
@@ -380,7 +417,7 @@ def get_file_type(file_path: str) -> Tuple[bool, bool, bool]:
 
 def check_file_type_and_upload(task_id: str, file_path: str) -> None:
     is_audio, is_video, is_photo = get_file_type(file_path)
-    upload_to_tg(task_id, file_path, is_audio=is_audio, is_video=is_video, is_photo=is_photo)
+    upload_to_tg(task_id, file_path, is_audio=is_audio, is_video=is_video, is_photo=is_photo, thumb=get_file_thumb(file_path))
 
 def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> None:
     file_name = os.path.basename(down_path)
@@ -405,11 +442,12 @@ def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> N
                             if is_audio:
                                 media_list.append(types.InputMediaAudio(media=file, caption=f"<code>{name}</code>", parse_mode=enums.ParseMode.HTML))
                             elif is_video:
-                                media_list.append(types.InputMediaVideo(media=file, caption=f"<code>{name}</code>", parse_mode=enums.ParseMode.HTML, supports_streaming=True))
+                                media_list.append(types.InputMediaVideo(media=file, caption=f"<code>{name}</code>", thumb=get_file_thumb(file),
+                                                                        parse_mode=enums.ParseMode.HTML, supports_streaming=True))
                             elif is_photo:
                                 media_list.append(types.InputMediaPhoto(media=file, caption=f"<code>{name}</code>", parse_mode=enums.ParseMode.HTML))
                             else:
-                                media_list.append(types.InputMediaDocument(media=file))
+                                media_list.append(types.InputMediaDocument(media=file, caption=f"<code>{name}</code>", parse_mode=enums.ParseMode.HTML))
                         upload_to_tg(task_id, file_name, media_list)
             else:
                 for file in files_list:
@@ -1108,28 +1146,31 @@ def qbit_listener() -> None:
     logger.info("Starting qbit download event listener")
     while True:
         if qb_client := get_qbit_client():
-            for torrent in qb_client.torrents_info(status_filter="all"):
-                present_in_dict = torrent.get('hash') in QBIT_STATUS_DICT
-                if torrent.state_enum.is_complete or "pausedUP" == torrent.state_enum.value:
-                    if present_in_dict:
-                        if QBIT_STATUS_DICT.get(torrent.get('hash')) == "NOT_SENT":
-                            msg = f"✅ <b>Downloaded: </b><code>{torrent.get('name')}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(torrent.get('size'))}</code>\n" \
-                                  f"⏳ <b>Time taken: </b><code>{humanize.naturaldelta(torrent.get('completion_on') - torrent.get('added_on'))}</code>"
-                            if tunnel := ngrok.get_tunnels():
-                                file_name = torrent.files[0].get('name').split("/")[0] if torrent.files else torrent.get('name')
-                                msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(file_name)}"
-                            send_status_update(msg)
-                            QBIT_STATUS_DICT[torrent.get('hash')] = "SENT"
-                            trigger_extract_upload(torrent, torrent.get('hash'))
-                    else:
-                        QBIT_STATUS_DICT[torrent.get('hash')] = "NOT_SENT"
-                if torrent.state_enum.is_errored:
-                    if present_in_dict:
-                        if QBIT_STATUS_DICT.get(torrent.get('hash')) == "NOT_SENT":
-                            send_status_update(f"❌ <b>Failed: </b><code>{torrent.get('name')}</code>")
-                            QBIT_STATUS_DICT[torrent.get('hash')] = "SENT"
-                    else:
-                        QBIT_STATUS_DICT[torrent.get('hash')] = "NOT_SENT"
+            try:
+                for torrent in qb_client.torrents_info(status_filter="all"):
+                    present_in_dict = torrent.get('hash') in QBIT_STATUS_DICT
+                    if torrent.state_enum.is_complete or "pausedUP" == torrent.state_enum.value:
+                        if present_in_dict:
+                            if QBIT_STATUS_DICT.get(torrent.get('hash')) == "NOT_SENT":
+                                msg = f"✅ <b>Downloaded: </b><code>{torrent.get('name')}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(torrent.get('size'))}</code>\n" \
+                                      f"⏳ <b>Time taken: </b><code>{humanize.naturaldelta(torrent.get('completion_on') - torrent.get('added_on'))}</code>"
+                                if tunnel := ngrok.get_tunnels():
+                                    file_name = torrent.files[0].get('name').split("/")[0] if torrent.files else torrent.get('name')
+                                    msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(file_name)}"
+                                send_status_update(msg)
+                                QBIT_STATUS_DICT[torrent.get('hash')] = "SENT"
+                                trigger_extract_upload(torrent, torrent.get('hash'))
+                        else:
+                            QBIT_STATUS_DICT[torrent.get('hash')] = "NOT_SENT"
+                    if torrent.state_enum.is_errored:
+                        if present_in_dict:
+                            if QBIT_STATUS_DICT.get(torrent.get('hash')) == "NOT_SENT":
+                                send_status_update(f"❌ <b>Failed: </b><code>{torrent.get('name')}</code>")
+                                QBIT_STATUS_DICT[torrent.get('hash')] = "SENT"
+                        else:
+                            QBIT_STATUS_DICT[torrent.get('hash')] = "NOT_SENT"
+            except qbittorrentapi.APIConnectionError:
+                logger.warning("Error in qbit listener [APIConnectionError]")
             qb_client.auth_log_out()
         time.sleep(10)
 
