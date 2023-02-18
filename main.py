@@ -116,21 +116,22 @@ def get_qbit_client() -> Optional[qbittorrentapi.Client]:
         logger.error(f"Failed to initialize client: {str(err)}")
         return None
 
-def send_status_update(msg: str, userid: Optional[str] = None) -> None:
+def send_status_update(msg: str, userid: Optional[str] = None) -> Dict[str, str]:
     tg_api_url = "https://api.telegram.org/bot{}/sendMessage"
     headers = {
         "accept": "application/json",
         "User-Agent": "Telegram Bot SDK - (https://github.com/irazasyed/telegram-bot-sdk)",
         "content-type": "application/json"
     }
+    msg_chat_dict: Dict[str, str] = dict()
     for user_id in AUTHORIZED_USERS:
         if userid is not None and userid != user_id:
             continue
         payload = {
             "text": msg,
             "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-            "disable_notification": False,
+            "disable_web_page_preview": True,
+            "disable_notification": True,
             "reply_to_message_id": None,
             "chat_id": user_id
         }
@@ -138,9 +139,23 @@ def send_status_update(msg: str, userid: Optional[str] = None) -> None:
             response = requests.post(tg_api_url.format(BOT_TOKEN), json=payload, headers=headers)
             if response.ok:
                 logger.info(f"Status msg sent to: {user_id}")
-            response.close()
+                resp_json = json.loads(response.text).get("result")
+                msg_id = resp_json.get("message_id")
+                chat_id = resp_json.get("chat").get("id")
+                msg_chat_dict[msg_id] = chat_id
+                response.close()
         except requests.exceptions.RequestException:
             logger.error(f"Failed to send updates to {user_id}")
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning("Failed to get sent message detail")
+    return msg_chat_dict
+
+def delete_msg(msg_id: str, chat_id: Union[str, int]) -> None:
+    if pyro_app is not None and msg_id is not None and chat_id is not None:
+        try:
+            pyro_app.delete_messages(chat_id=chat_id, message_ids=int(msg_id))
+        except errors.RPCError:
+            logger.warning(f"Failed to delete msg: {msg_id}")
 
 def get_oauth_creds():
     logger.info("Loading token.pickle file")
@@ -279,6 +294,8 @@ def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Opt
     folder_id = None
     is_dir = False
     file_name = None
+    task_done = False
+    msg_chat_dict: Dict[str, str] = dict()
     task_id: Optional[str] = None
     try:
         aria2c.client.save_session()
@@ -305,7 +322,7 @@ def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Opt
             return
         else:
             if creds := get_oauth_creds():
-                send_status_update(f"🗂️ <b>File: </b><code>{file_name}</code> <b>upload started</b> ⏳")
+                msg_chat_dict = send_status_update(f"🗂️ <b>File: </b><code>{file_name}</code> <b>upload started</b> ⏳")
                 if os.path.isdir(file_path) is True:
                     is_dir = True
                     if folder_id := create_folder(os.path.basename(file_path), creds):
@@ -336,11 +353,23 @@ def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Opt
                     clear_task_files(gid, False)
                 if hash is not None:
                     clear_task_files(hash, True)
-            return True
+            task_done = True
         else:
             delete_empty_folder(folder_id, creds)
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <i>Please check the log for more details using</i> <code>/{LOG_CMD}</code>")
-            return False
+    for msg_id in msg_chat_dict:
+        delete_msg(msg_id, msg_chat_dict[msg_id])
+    return task_done
+
+async def tg_upload_progress(current: int, total: int, file_name, user_id, stat_msg_id) -> None:
+    if stat_msg_id is not None:
+        try:
+            await pyro_app.edit_message_text(
+                chat_id=user_id, message_id=stat_msg_id,
+                text=f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(total)}</code>\n"
+                     f"⚡ <b>Processed: </b><code>{humanize.naturalsize(current)} [{round(number=current * 100 / total, ndigits=1)}%]</code>")
+        except errors.RPCError:
+            logger.warning("Failed to update upload status")
 
 @retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=(retry_if_exception_type(errors.RPCError)))
 def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.InputMediaDocument]] = None,
@@ -350,6 +379,18 @@ def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.I
     if pyro_app is None:
         send_status_update(f"⚠️ <b>Skip upload: </b><code>{file_name}</code>\n<b>Reason: </b>Pyrogram session is not initialized", user_id)
         return
+    stat_msg_id = None
+    if user_id is not None:
+        if media_list is None:
+            msg_txt = f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(os.stat(file_path).st_size)}</code>"
+        else:
+            msg_txt = f"📤 <b>Upload started [media group]</b>\n🗂️ <b>Folder: </b><code>{file_name}</code>\n📀 <b>Total Size: </b><code>"
+            size = 0
+            for media_file in media_list:
+                size += os.stat(media_file.media).st_size
+            msg_txt += f"{humanize.naturalsize(size)}</code>\n📚 <b>Total Files: </b><code>{len(media_list)}</code>"
+        for msg_id in send_status_update(msg_txt, user_id):
+            stat_msg_id = msg_id
     user_id = "self" if user_id is None else user_id
     logger.info(f"Tg Upload started: {file_name} [Total items: {len(media_list)}]") if media_list else logger.info(f"Tg Upload started: {file_name}")
     try:
@@ -357,17 +398,19 @@ def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.I
             pyro_app.send_media_group(chat_id=user_id, media=media_list, disable_notification=True, protect_content=False)
         elif is_audio:
             pyro_app.send_audio(chat_id=user_id, audio=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                file_name=file_name, disable_notification=True, protect_content=False)
+                                file_name=file_name, disable_notification=True, protect_content=False, progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id))
         elif is_video:
             pyro_app.send_video(chat_id=user_id, video=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                file_name=file_name, thumb=thumb, supports_streaming=True, disable_notification=True, protect_content=False)
+                                file_name=file_name, thumb=thumb, supports_streaming=True, disable_notification=True, protect_content=False,
+                                progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id))
         elif is_photo:
             pyro_app.send_photo(chat_id=user_id, photo=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                disable_notification=True, protect_content=False)
+                                disable_notification=True, protect_content=False, progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id))
         else:
             pyro_app.send_document(chat_id=user_id, document=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                   file_name=file_name, disable_notification=True, protect_content=False)
+                                   file_name=file_name, disable_notification=True, protect_content=False, progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id))
         logger.info(f"Tg Upload completed: {file_name} [Total items: {len(media_list)}]") if media_list else logger.info(f"Tg Upload completed: {file_name}")
+        delete_msg(msg_id=stat_msg_id, chat_id=user_id)
     except (ValueError, FileNotFoundError) as err:
         logger.error(f"Tg Upload failed: {file_name} [{str(err)}]")
     except errors.FloodWait as err:
@@ -394,11 +437,11 @@ def get_file_thumb(file_path: str) -> Optional[str]:
         if duration == 0 and is_video is False:
             logger.warning(f"Unable to get thumb: {name}, reason: duration is 0")
         else:
-            ffmpeg_proc = ffmpeg.input(file_path, ss=duration // 2 if duration >= 4 else 3).output(out_file, vframes=1).run_async(quiet=True)
+            ffmpeg_proc = ffmpeg.input(file_path, ss=duration // 2 if duration >= 4 else 60).output(out_file, vframes=1).run_async(quiet=True)
             ffmpeg_out, _ = ffmpeg_proc.communicate()
             if os.path.exists(out_file):
                 with Image.open(out_file) as img:
-                    img.resize(size=(320, 320)).convert(mode="RGB").save(out_file, "JPEG")
+                    img.resize(size=(320, 180)).convert(mode="RGB").save(out_file, "JPEG")
                 return out_file
     except (FFProbeError, ffmpeg.Error, UnidentifiedImageError, ValueError, TypeError, OSError) as err:
         logger.warning(f"Failed to get thumb for {name}{ext}[{str(err)}]")
@@ -417,7 +460,7 @@ def get_file_type(file_path: str) -> Tuple[bool, bool, bool]:
 
 def check_file_type_and_upload(task_id: str, file_path: str) -> None:
     is_audio, is_video, is_photo = get_file_type(file_path)
-    upload_to_tg(task_id, file_path, is_audio=is_audio, is_video=is_video, is_photo=is_photo, thumb=get_file_thumb(file_path))
+    upload_to_tg(task_id, file_path, is_audio=is_audio, is_video=is_video, is_photo=is_photo, thumb=get_file_thumb(file_path) if is_video else None)
 
 def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> None:
     file_name = os.path.basename(down_path)
@@ -426,8 +469,7 @@ def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> N
         if os.path.isdir(down_path):
             files_list = []
             for address, dirs, files in sorted(os.walk(down_path)):
-                files_list.extend([os.path.join(address, file) for file in files
-                                   if shutil.disk_usage(os.path.join(address, file)).used > 0])
+                files_list.extend([os.path.join(address, file) for file in files if os.stat(os.path.join(address, file)).st_size > 0])
             files_list = natsorted(files_list)
             if in_group:
                 if files_list and len(files_list) < 2:
@@ -453,11 +495,11 @@ def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> N
                 for file in files_list:
                     check_file_type_and_upload(task_id, file)
         else:
-            if shutil.disk_usage(down_path).used == 0:
+            if os.stat(down_path).st_size == 0:
                 logger.warning(f"Skip upload: {file_name}, reason: empty file")
             check_file_type_and_upload(task_id, down_path)
-    except RetryError as err:
-        logger.error(f"Tg Upload failed: {file_name}, attempts: {err.last_attempt.attempt_number}")
+    except (RetryError, FileNotFoundError) as err:
+        logger.error(f"Tg Upload failed: {file_name}, attempts: {err.last_attempt.attempt_number if isinstance(err, RetryError) else f'[{str(err)}]'}")
         send_status_update(f"❗<b>Upload failed: </b><code>{file_name}</code>\n<i>Check log for more details</i>",
                            LEECH_CHAT_DICT[task_id] if task_id in LEECH_CHAT_DICT else None)
     else:
@@ -678,7 +720,7 @@ def is_file_extracted(file_name: str) -> bool:
     folder_name = os.path.splitext(file_name)[0]
     folder_path = f"{DOWNLOAD_PATH}/{folder_name}"
     try:
-        folder_size = shutil.disk_usage(folder_path).used if os.path.exists(folder_path) else 0
+        folder_size = os.stat(folder_path).st_size if os.path.exists(folder_path) else 0
         file_size = os.path.getsize(f"{DOWNLOAD_PATH}/{file_name}")
         return folder_size >= file_size
     except OSError:
