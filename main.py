@@ -91,7 +91,7 @@ ARIA_COMMAND = "aria2c --allow-overwrite=true --auto-file-renaming=true --check-
 MAGNET_REGEX = r"magnet:\?xt=urn:btih:[a-zA-Z0-9]*"
 URL_REGEX = r"(?:(?:https?|ftp):\/\/)?[\w/\-?=%.]+\.[\w/\-?=%.]+"
 DOWNLOAD_PATH = "/usr/src/app/downloads"
-ARIA_OPTS = {'dir': DOWNLOAD_PATH.rstrip("/"), 'max-upload-limit': '3M'}
+ARIA_OPTS = {'dir': DOWNLOAD_PATH.rstrip("/"), 'max-upload-limit': '5M'}
 GDRIVE_PERM = {
     'role': 'reader',
     'type': 'anyone',
@@ -486,8 +486,8 @@ def get_qbit_info(hash: str, client: qbittorrentapi.Client = None) -> str:
     for torrent in client.torrents_info(torrent_hashes=[hash]):
         info += f"🗂 <b>Name:</b> <code>{torrent.name}</code>\n🚦 <b>Status:</b> <code>{torrent.state_enum.value}</code>\n📀 <b>Size:</b> <code>{humanize.naturalsize(torrent.total_size)}</code>\n"\
             f"📥 <b>Downloaded:</b> <code>{humanize.naturalsize(torrent.downloaded)} ({round(number=torrent.progress * 100, ndigits=2)}%)</code>\n📦 <b>Remaining: </b><code>{humanize.naturalsize(torrent.amount_left)}</code>\n"\
-            f"🧩 <b>Peers:</b> <code>{torrent.num_leechs}</code>\n🥑 <b>Seeders:</b> <code>{torrent.num_seeds}</code>\n⚡ <b>Speed:</b> <code>{humanize.naturalsize(torrent.dlspeed)}/s</code>\n"\
-            f"⏳ <b>ETA:</b> <code>{humanize.naturaldelta(torrent.eta)}</code>\n⚙️ <b>Engine: </b><code>Qbittorent</code>"
+            f"🧩 <b>Peers:</b> <code>{torrent.num_leechs}</code> 🥑 <b>Seeders:</b> <code>{torrent.num_seeds}</code>\n"\
+            f"⚡ <b>Speed:</b> <code>{humanize.naturalsize(torrent.dlspeed)}/s</code> ⏳ <b>ETA:</b> <code>{humanize.naturaldelta(torrent.eta)}</code>\n⚙️ <b>Engine: </b><code>Qbittorent</code>"
         try:
             info += f"\n📚 <b>Total Files:</b> <code>{len(client.torrents_files(torrent_hash=hash))}</code>\n"
             # if len(client.torrents_files(torrent_hash=hash)) > 1:
