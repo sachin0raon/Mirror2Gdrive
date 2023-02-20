@@ -4,7 +4,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
 credentials = None
-__G_DRIVE_TOKEN_FILE = "token.pickle"
+__G_DRIVE_TOKEN_FILE = "/mnt/token.pickle"
 __OAUTH_SCOPE = ["https://www.googleapis.com/auth/drive"]
 if os.path.exists(__G_DRIVE_TOKEN_FILE):
     with open(__G_DRIVE_TOKEN_FILE, 'rb') as f:
@@ -18,7 +18,7 @@ if os.path.exists(__G_DRIVE_TOKEN_FILE):
             credentials.refresh(Request())
 else:
     flow = InstalledAppFlow.from_client_secrets_file(
-        'credentials.json', __OAUTH_SCOPE)
+        '/mnt/credentials.json', __OAUTH_SCOPE)
     credentials = flow.run_local_server(port=0, open_browser=False)
 
 # Save the credentials for the next run

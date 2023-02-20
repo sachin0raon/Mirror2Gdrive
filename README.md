@@ -1,5 +1,5 @@
 # Mirror2GDrive
-Hello there, 👽 I am a Telegram Bot that can download files using Aria2/Qbittorrent and upload them to your GDrive.
+Hello there, 👽 I am a Telegram Bot that can download files using Aria2/Qbittorrent and upload them to your GDrive or Telegram. I can run only on Linux x86_64/amd64 system.
 
 ### Available Commands
 ```sh
@@ -44,6 +44,16 @@ docker run -d --name=Mirror2GdriveBot \
   -e CONFIG_FILE_URL="github gist link of config.env" \
   --restart=unless-stopped \
   -v $PWD:/usr/src/app `#optional: for data persistence` \
-  -p 8010:8090 -p 8020:6800 `#optional: for accessing qbit/aria ` \
+  -p 8010:8090 -p 8020:6800 `#optional: for accessing qbit/aria` \
   mybot:latest
+```
+
+### Extras
+- To generate token.pickle file. First place the credentials.json file in current directory and run.
+```sh
+docker run --rm -it -v $PWD:/mnt --net host --entrypoint python mybot:latest generate_token_pickle.py
+```
+- To get the user session string of your bot.
+```sh
+docker run --rm -it --entrypoint python mybot:latest session_generator.py
 ```
