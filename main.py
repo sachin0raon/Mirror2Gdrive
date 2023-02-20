@@ -361,15 +361,27 @@ def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Opt
         delete_msg(msg_id, msg_chat_dict[msg_id])
     return task_done
 
-async def tg_upload_progress(current: int, total: int, file_name, user_id, stat_msg_id) -> None:
+async def tg_upload_progress(current: int, total: int, file_name, user_id, stat_msg_id, up_start_time) -> None:
     if stat_msg_id is not None:
         try:
             await pyro_app.edit_message_text(
                 chat_id=user_id, message_id=stat_msg_id,
                 text=f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(total)}</code>\n"
-                     f"⚡ <b>Processed: </b><code>{humanize.naturalsize(current)} [{round(number=current * 100 / total, ndigits=1)}%]</code>")
+                     f"💾 <b>Processed: </b><code>{humanize.naturalsize(current)} [{round(number=current * 100 / total, ndigits=1)}%]</code>\n"
+                     f"⚡ <b>Speed: </b><code>{humanize.naturalsize(current / (time.time() - up_start_time))}/s</code>")
         except errors.RPCError:
             logger.warning("Failed to update upload status")
+
+def get_duration(file_path: str) -> int:
+    duration = 0
+    try:
+        for stream in FFProbe(file_path).streams:
+            if stream.is_video() or stream.is_audio():
+                duration = int(stream.duration_seconds())
+                break
+    except (FFProbeError, AttributeError):
+        pass
+    return duration
 
 @retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=(retry_if_exception_type(errors.RPCError)))
 def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.InputMediaDocument]] = None,
@@ -393,22 +405,25 @@ def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.I
             stat_msg_id = msg_id
     user_id = "self" if user_id is None else user_id
     logger.info(f"Tg Upload started: {file_name} [Total items: {len(media_list)}]") if media_list else logger.info(f"Tg Upload started: {file_name}")
+    up_start_time = time.time()
     try:
         if media_list is not None:
             pyro_app.send_media_group(chat_id=user_id, media=media_list, disable_notification=True, protect_content=False)
         elif is_audio:
             pyro_app.send_audio(chat_id=user_id, audio=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                file_name=file_name, disable_notification=True, protect_content=False, progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id))
+                                file_name=file_name, disable_notification=True, protect_content=False, progress=tg_upload_progress,
+                                progress_args=(file_name, user_id, stat_msg_id, up_start_time), duration=get_duration(file_path))
         elif is_video:
             pyro_app.send_video(chat_id=user_id, video=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
                                 file_name=file_name, thumb=thumb, supports_streaming=True, disable_notification=True, protect_content=False,
-                                progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id))
+                                progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id, up_start_time), duration=get_duration(file_path))
         elif is_photo:
             pyro_app.send_photo(chat_id=user_id, photo=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                disable_notification=True, protect_content=False, progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id))
+                                disable_notification=True, protect_content=False, progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id, up_start_time))
         else:
             pyro_app.send_document(chat_id=user_id, document=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                   file_name=file_name, disable_notification=True, protect_content=False, progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id))
+                                   file_name=file_name, disable_notification=True, protect_content=False, progress=tg_upload_progress,
+                                   progress_args=(file_name, user_id, stat_msg_id, up_start_time))
         logger.info(f"Tg Upload completed: {file_name} [Total items: {len(media_list)}]") if media_list else logger.info(f"Tg Upload completed: {file_name}")
         delete_msg(msg_id=stat_msg_id, chat_id=user_id)
     except (ValueError, FileNotFoundError) as err:
@@ -423,27 +438,15 @@ def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.I
 def get_file_thumb(file_path: str) -> Optional[str]:
     name, ext = os.path.splitext(os.path.basename(file_path))
     out_file = f"/tmp/{name}_thumb.jpg"
-    duration = 0
-    is_video = False
+    duration = get_duration(file_path)
     try:
-        for stream in FFProbe(file_path).streams:
-            if stream.is_video():
-                is_video = True
-                try:
-                    duration = stream.duration_seconds()
-                except FFProbeError:
-                    pass
-                break
-        if duration == 0 and is_video is False:
-            logger.warning(f"Unable to get thumb: {name}, reason: duration is 0")
-        else:
-            ffmpeg_proc = ffmpeg.input(file_path, ss=duration // 2 if duration >= 4 else 60).output(out_file, vframes=1).run_async(quiet=True)
-            ffmpeg_out, _ = ffmpeg_proc.communicate()
-            if os.path.exists(out_file):
-                with Image.open(out_file) as img:
-                    img.resize(size=(320, 180)).convert(mode="RGB").save(out_file, "JPEG")
-                return out_file
-    except (FFProbeError, ffmpeg.Error, UnidentifiedImageError, ValueError, TypeError, OSError) as err:
+        ffmpeg_proc = ffmpeg.input(file_path, ss=duration // 2 if duration >= 4 else 30).output(out_file, vframes=1).run_async(quiet=True)
+        ffmpeg_out, _ = ffmpeg_proc.communicate()
+        if os.path.exists(out_file):
+            with Image.open(out_file) as img:
+                img.resize(size=(320, 180)).convert(mode="RGB").save(out_file, "JPEG")
+            return out_file
+    except (ffmpeg.Error, UnidentifiedImageError, ValueError, TypeError, OSError) as err:
         logger.warning(f"Failed to get thumb for {name}{ext}[{str(err)}]")
 
 def get_file_type(file_path: str) -> Tuple[bool, bool, bool]:
@@ -482,10 +485,11 @@ def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> N
                             is_audio, is_video, is_photo = get_file_type(file)
                             name = os.path.basename(file)
                             if is_audio:
-                                media_list.append(types.InputMediaAudio(media=file, caption=f"<code>{name}</code>", parse_mode=enums.ParseMode.HTML))
+                                media_list.append(types.InputMediaAudio(media=file, caption=f"<code>{name}</code>", parse_mode=enums.ParseMode.HTML,
+                                                                        duration=get_duration(file)))
                             elif is_video:
                                 media_list.append(types.InputMediaVideo(media=file, caption=f"<code>{name}</code>", thumb=get_file_thumb(file),
-                                                                        parse_mode=enums.ParseMode.HTML, supports_streaming=True))
+                                                                        parse_mode=enums.ParseMode.HTML, supports_streaming=True, duration=get_duration(file)))
                             elif is_photo:
                                 media_list.append(types.InputMediaPhoto(media=file, caption=f"<code>{name}</code>", parse_mode=enums.ParseMode.HTML))
                             else:
@@ -503,8 +507,9 @@ def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> N
         send_status_update(f"❗<b>Upload failed: </b><code>{file_name}</code>\n<i>Check log for more details</i>",
                            LEECH_CHAT_DICT[task_id] if task_id in LEECH_CHAT_DICT else None)
     else:
-        logger.info(f"Cleaning up: {file_name}")
-        shutil.rmtree(path=down_path, ignore_errors=True)
+        if AUTO_DEL_TASK is True:
+            logger.info(f"Cleaning up: {file_name}")
+            shutil.rmtree(path=down_path, ignore_errors=True)
 
 def get_user(update: Update) -> Union[str, int]:
     return update.message.from_user.name if update.message.from_user.name is not None else update.message.chat_id
@@ -1259,7 +1264,9 @@ def start_pyrogram() -> None:
             parse_mode=enums.ParseMode.HTML,
             bot_token=os.environ["BOT_TOKEN"] if not sess_str else None,
             session_string=sess_str if sess_str else None,
-            in_memory=True if sess_str else None
+            in_memory=True if sess_str else None,
+            takeout=True,
+            max_concurrent_transmissions=10
         )
         pyro_app.start()
         logger.info(f"Session started, premium: {pyro_app.me.is_premium}")
