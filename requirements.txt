@@ -16,3 +16,4 @@ natsort==8.2.0
 Pillow==9.4.0
 ffmpeg-python==0.2.0
 ffprobe-python==1.0.3
+filesplit==4.0.1

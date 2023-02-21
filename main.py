@@ -18,6 +18,7 @@ import patoolib
 import qbittorrentapi
 from natsort import natsorted
 from PIL import Image, UnidentifiedImageError
+from filesplit.split import Split
 from ffprobe import FFProbe
 from ffprobe.exceptions import FFProbeError
 from patoolib import ArchiveMimetypes
@@ -60,6 +61,8 @@ AUTHORIZED_USERS = set()
 QBIT_STATUS_DICT = dict()
 UPLOAD_MODE_DICT = dict()
 LEECH_CHAT_DICT = dict()
+FOUR_GB = 4194304000
+TWO_GB = 2097152000
 PICKLE_FILE_NAME = "token.pickle"
 START_CMD = "start"
 MIRROR_CMD = "mirror"
@@ -377,10 +380,15 @@ def get_duration(file_path: str) -> int:
     try:
         for stream in FFProbe(file_path).streams:
             if stream.is_video() or stream.is_audio():
-                duration = int(stream.duration_seconds())
+                duration = round(stream.duration_seconds())
                 break
     except (FFProbeError, AttributeError):
-        pass
+        try:
+            probe = ffmpeg.probe(file_path)
+            _stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video' or stream['codec_type'] == 'audio'), None)
+            duration = round(float(_stream.get('duration', 0)))
+        except (ffmpeg.Error, ValueError) as err:
+            logger.warning(f"probe error: {str(err)}")
     return duration
 
 @retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=(retry_if_exception_type(errors.RPCError)))
@@ -461,9 +469,70 @@ def get_file_type(file_path: str) -> Tuple[bool, bool, bool]:
             is_photo = True
     return is_audio, is_video, is_photo
 
+def split_file(file_path: str, file_size: int, is_video: bool = True, is_audio: bool = False, task_id: str = None) -> List[str]:
+    _name, _ext = os.path.splitext(os.path.basename(file_path))
+    parts = math.ceil(file_size/FOUR_GB if pyro_app.me.is_premium else TWO_GB)
+    split_size = math.ceil(file_size/parts)
+    out_dir = f"{DOWNLOAD_PATH}/splits/{_name}"
+    os.makedirs(out_dir, exist_ok=True)
+    split_files_list: List[str] = []
+    user_id = LEECH_CHAT_DICT[task_id] if task_id is not None and task_id in LEECH_CHAT_DICT else None
+    err_msg = f"❗<b>Upload failed: </b><code>{_name}{_ext}</code> <b>due to error while splitting</b>\n"
+    _task_done = False
+    if is_video or is_audio:
+        i = 1
+        start_time = 0
+        orig_duration = get_duration(file_path)
+        try:
+            while i <= parts or start_time < orig_duration - 4:
+                parted_name = f"{out_dir}/{_name}.part{str(i).zfill(3)}{_ext}"
+                _pname = os.path.basename(parted_name)
+                ff_proc = ffmpeg.input(file_path, ss=start_time).output(parted_name, map_chapters=-1, fs=split_size, c="copy").run_async(quiet=True)
+                _, _ = ff_proc.communicate()
+                if os.path.exists(parted_name):
+                    processed_dur = get_duration(parted_name) - 3
+                    if processed_dur <= 0:
+                        raise ValueError(f"Split error: {_pname}[Duration is 0]")
+                    else:
+                        start_time += processed_dur
+                        split_files_list.append(parted_name)
+                        logger.info(f"Split created: {_pname}")
+                else:
+                    raise FileNotFoundError(f"Split error: {_pname}[file not generated]")
+                i += 1
+            _task_done = True
+        except (ffmpeg.Error, FileNotFoundError, ValueError) as err:
+            logger.error(f"Split error: {_name}{_ext}[{str(err)}]")
+            send_status_update(f"{err_msg}<b>Error: </b><code>{str(err)}</code>", user_id)
+    else:
+        logger.info(f"Starting to split: {_name}{_ext}")
+        _split_files: List[str] = []
+        try:
+            _split = Split(file_path, out_dir)
+            _split.manfilename = "bot_manfile"
+            _split.bysize(size=split_size, newline=True, includeheader=False)
+            _split_files.extend([f"{out_dir}/{_file}" for _file in os.listdir(out_dir) if "bot_manfile" != _file])
+            for _file in natsorted(_split_files):
+                _new_file = f"{out_dir}/{_name}{_ext}.{str(_file.split('_')[-1].split('.')[0]).zfill(3)}"
+                shutil.move(src=_file, dst=_new_file)
+                split_files_list.append(_new_file)
+            _task_done = True
+        except Exception as err:
+            logger.error(f"Split error: {_name}{_ext}[{str(err)}]")
+            send_status_update(f"{err_msg}<b>Error: </b><code>{str(err)}</code>", user_id)
+    if not _task_done:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        split_files_list.clear()
+    return split_files_list
+
 def check_file_type_and_upload(task_id: str, file_path: str) -> None:
     is_audio, is_video, is_photo = get_file_type(file_path)
-    upload_to_tg(task_id, file_path, is_audio=is_audio, is_video=is_video, is_photo=is_photo, thumb=get_file_thumb(file_path) if is_video else None)
+    file_size = os.stat(file_path).st_size
+    if (file_size > TWO_GB and not pyro_app.me.is_premium) or (file_size > FOUR_GB and pyro_app.me.is_premium):
+        for _file in split_file(file_path, file_size, is_video, is_audio, task_id):
+            upload_to_tg(task_id, _file, is_audio=is_audio, is_video=is_video, is_photo=is_photo, thumb=get_file_thumb(_file) if is_video else None)
+    else:
+        upload_to_tg(task_id, file_path, is_audio=is_audio, is_video=is_video, is_photo=is_photo, thumb=get_file_thumb(file_path) if is_video else None)
 
 def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> None:
     file_name = os.path.basename(down_path)
@@ -501,7 +570,8 @@ def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> N
         else:
             if os.stat(down_path).st_size == 0:
                 logger.warning(f"Skip upload: {file_name}, reason: empty file")
-            check_file_type_and_upload(task_id, down_path)
+            else:
+                check_file_type_and_upload(task_id, down_path)
     except (RetryError, FileNotFoundError) as err:
         logger.error(f"Tg Upload failed: {file_name}, attempts: {err.last_attempt.attempt_number if isinstance(err, RetryError) else f'[{str(err)}]'}")
         send_status_update(f"❗<b>Upload failed: </b><code>{file_name}</code>\n<i>Check log for more details</i>",
@@ -510,6 +580,7 @@ def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> N
         if AUTO_DEL_TASK is True:
             logger.info(f"Cleaning up: {file_name}")
             shutil.rmtree(path=down_path, ignore_errors=True)
+            shutil.rmtree(path=f"{DOWNLOAD_PATH}/splits/{os.path.splitext(file_name)[0]}", ignore_errors=True)
 
 def get_user(update: Update) -> Union[str, int]:
     return update.message.from_user.name if update.message.from_user.name is not None else update.message.chat_id
