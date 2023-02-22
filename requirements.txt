@@ -1,4 +1,4 @@
-python-telegram-bot==20.0
+python-telegram-bot[job-queue]==20.0
 google-api-python-client==2.60.0
 google-auth-oauthlib==1.0.0
 humanize==4.4.0
@@ -17,3 +17,4 @@ Pillow==9.4.0
 ffmpeg-python==0.2.0
 ffprobe-python==1.0.3
 filesplit==4.0.1
+uvloop==0.17.0
