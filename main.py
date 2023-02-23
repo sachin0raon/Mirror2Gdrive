@@ -16,8 +16,12 @@ import magic
 import ffmpeg
 import patoolib
 import qbittorrentapi
+import asyncio
+import uvloop
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 from natsort import natsorted
 from PIL import Image, UnidentifiedImageError
+from filesplit.split import Split
 from ffprobe import FFProbe
 from ffprobe.exceptions import FFProbeError
 from patoolib import ArchiveMimetypes
@@ -25,7 +29,6 @@ from qbit_conf import QBIT_CONF
 from pyngrok import ngrok, conf
 from urllib.parse import quote
 from io import StringIO
-from asyncio import sleep
 from typing import Union, Optional, Dict, List, Tuple
 from dotenv import load_dotenv
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError, Retrying
@@ -47,6 +50,7 @@ logging.basicConfig(
 logging.getLogger("pyngrok.ngrok").setLevel(logging.ERROR)
 logging.getLogger("pyngrok.process").setLevel(logging.ERROR)
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
+logging.getLogger("apscheduler.executors.default").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 aria2c: Optional[aria2p.API] = None
 pyro_app: Optional[Client] = None
@@ -60,6 +64,8 @@ AUTHORIZED_USERS = set()
 QBIT_STATUS_DICT = dict()
 UPLOAD_MODE_DICT = dict()
 LEECH_CHAT_DICT = dict()
+FOUR_GB = 4194304000
+TWO_GB = 2097152000
 PICKLE_FILE_NAME = "token.pickle"
 START_CMD = "start"
 MIRROR_CMD = "mirror"
@@ -88,8 +94,8 @@ ARIA_COMMAND = "aria2c --allow-overwrite=true --auto-file-renaming=true --check-
                "--quiet=true --rpc-max-request-size=1024M --split=10 --summary-interval=0 --seed-time=0 --bt-enable-lpd=true "\
                "--bt-detach-seed-only=true --bt-remove-unselected-file=true --follow-torrent=mem --bt-tracker={} "\
                "--keep-unfinished-download-result=true --save-not-found=true --save-session=/usr/src/app/aria2.session --save-session-interval=60"
-MAGNET_REGEX = r"magnet:\?xt=urn:btih:[a-zA-Z0-9]*"
-URL_REGEX = r"(?:(?:https?|ftp):\/\/)?[\w/\-?=%.]+\.[\w/\-?=%.]+"
+MAGNET_REGEX = r'magnet:\?xt=urn:(btih|btmh):[a-zA-Z0-9]*'
+URL_REGEX = r'^(https?://|ftp://)?(www\.)?[^/\s]+\.[^/\s:]+(:\d+)?(/[^?\s]*)?(\?[^#\s]*)?(#.*)?$'
 DOWNLOAD_PATH = "/usr/src/app/downloads"
 ARIA_OPTS = {'dir': DOWNLOAD_PATH.rstrip("/"), 'max-upload-limit': '5M'}
 GDRIVE_PERM = {
@@ -150,12 +156,12 @@ def send_status_update(msg: str, userid: Optional[str] = None) -> Dict[str, str]
             logger.warning("Failed to get sent message detail")
     return msg_chat_dict
 
-def delete_msg(msg_id: str, chat_id: Union[str, int]) -> None:
+async def delete_msg(msg_id: str, chat_id: Union[str, int]) -> None:
     if pyro_app is not None and msg_id is not None and chat_id is not None:
         try:
-            pyro_app.delete_messages(chat_id=chat_id, message_ids=int(msg_id))
-        except errors.RPCError:
-            logger.warning(f"Failed to delete msg: {msg_id}")
+            await pyro_app.delete_messages(chat_id=chat_id, message_ids=int(msg_id))
+        except errors.RPCError as err:
+            logger.warning(f"Failed to delete msg: {msg_id}[{err.ID}]")
 
 def get_oauth_creds():
     logger.info("Loading token.pickle file")
@@ -203,8 +209,10 @@ def remove_extracted_dir(file_name: str) -> None:
     if is_archive_file(file_name) and os.path.exists(f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}"):
         shutil.rmtree(path=f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}", ignore_errors=True)
 
-def clear_task_files(task_id: str, is_qbit: bool) -> None:
+def clear_task_files(task_id: str = None, is_qbit: bool = False) -> None:
     file_name = None
+    if task_id is None:
+        return
     logger.info(f"Removing task: {task_id}")
     try:
         if is_qbit is True:
@@ -234,7 +242,7 @@ def create_folder(folder_name: str, creds) -> Optional[str]:
     except RetryError as err:
         last_err = err.last_attempt.exception()
         err_msg = f"⚠️ <b>Upload failed: </b><code>{folder_name}</code> <b>error in creating folder</b>\n<b>Reason: </b><code>{last_err.error_details}" +\
-                  f"[{last_err.status_code}]</code>" if isinstance(last_err, HttpError) else f"<code>{str(last_err)}</code>"
+                  f"[{last_err.status_code}]</code>" if isinstance(last_err, HttpError) else f"<code>{str(last_err).replace('<', '').replace('>', '')}</code>"
         logger.error(f"Failed to create folder: {folder_name} [attempts: {err.last_attempt.attempt_number}]")
         send_status_update(err_msg)
     else:
@@ -246,41 +254,89 @@ def create_folder(folder_name: str, creds) -> Optional[str]:
             logger.warning(f"Failed to set permission for: {folder_name}")
     return folder_id
 
-@retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=(retry_if_exception_type(Exception)))
-def upload_file(file_path: str, folder_id: str, creds, task_data: str = None) -> None:
+class UploadProgressUpdate:
+    def __init__(self, name: str = None, up_start_time: float = 0.0, current: int = 0, total: int = 0,
+                 user_id: str = None, stat_msg_id: Union[str, int] = None, delay: int = 5):
+        self.file_name = name
+        self.up_start_time = up_start_time
+        self.uploaded_bytes = current
+        self.total_bytes = total
+        self.user_id = user_id
+        self.stat_msg_id = stat_msg_id
+        self.delay = delay
+
+    async def set_processed_bytes(self, current: int = 0, total: int = 0) -> None:
+        self.uploaded_bytes = current
+
+    def sync_uploaded_bytes(self, _uploaded: int = 0):
+        self.uploaded_bytes = _uploaded
+
+    async def send_status_update(self) -> None:
+        try:
+            await pyro_app.edit_message_text(
+                  chat_id=self.user_id, message_id=self.stat_msg_id,
+                  text=f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{self.file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(self.total_bytes)}</code>\n"
+                       f"💾 <b>Processed: </b><code>{humanize.naturalsize(self.uploaded_bytes)} [{round(number=self.uploaded_bytes * 100 / self.total_bytes, ndigits=1)}%]</code>\n"
+                       f"⚡ <b>Speed: </b><code>{humanize.naturalsize(self.uploaded_bytes / (time.time() - self.up_start_time))}/s</code>")
+        except errors.RPCError as err:
+            logger.warning(f"Failed to update upload status [{err.ID}]")
+
+    async def trigger_update(self) -> None:
+        while self.uploaded_bytes < self.total_bytes and self.stat_msg_id is not None:
+            await asyncio.sleep(self.delay)
+            await self.send_status_update()
+
+def upload_file(file_path: str, folder_id: str, creds, task_data: str = None, from_dir: bool = False,
+                up_prog: UploadProgressUpdate = None) -> None:
     file_name = os.path.basename(file_path)
     file_metadata = {'name': file_name, 'parents': [folder_id]}
     logger.info(f"Starting upload: {file_name}")
-    gdrive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
-    drive_file = gdrive_service.files().create(
-        body=file_metadata, supportsAllDrives=True,
-        media_body=MediaFileUpload(filename=file_path, resumable=True, chunksize=50 * 1024 * 1024),
-        fields='id')
-    response = None
-    while response is None:
-        try:
-            _status, response = drive_file.next_chunk()
-        except HttpError as err:
-            if err.resp.get('content-type', '').startswith('application/json'):
-                message = eval(err.content).get('error').get('errors')[0].get('message')
-            else:
-                message = err.error_details
-            logger.warning(f"Retrying upload: {file_name} Reason: {message}")
-            raise err
-    logger.info(f"Upload completed for {file_name}")
-    drive_file = gdrive_service.files().get(fileId=response['id'], supportsAllDrives=True).execute()
-    logger.info(f"Setting permissions for {file_name}")
     try:
-        gdrive_service.permissions().create(fileId=drive_file.get('id'), body=GDRIVE_PERM, supportsAllDrives=True).execute()
-        gdrive_service.close()
-    except HttpError:
-        pass
-    if folder_id == GDRIVE_FOLDER_ID:
-        send_status_update(f"🗂️ <b>File:</b> <code>{file_name}</code> uploaded ✔️\n🌐 <b>Link:</b> {GDRIVE_BASE_URL.format(drive_file.get('id'))}")
-        if task_data:
-            task_d = task_data.split(sep="#", maxsplit=1)
-            task_id = task_d[1]
-            clear_task_files(task_id, True if task_d[0] == "qbit" else False)
+        for attempt in Retrying(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=retry_if_exception_type(Exception)):
+            with attempt:
+                gdrive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+                drive_file = gdrive_service.files().create(
+                    body=file_metadata, supportsAllDrives=True,
+                    media_body=MediaFileUpload(filename=file_path, resumable=True, chunksize=50 * 1024 * 1024),
+                    fields='id')
+                response = None
+                up_prog.file_name = file_name
+                up_prog.uploaded_bytes = 0
+                up_prog.total_bytes = os.stat(file_path).st_size
+                up_prog.up_start_time = time.time()
+                while response is None:
+                    try:
+                        _status, response = drive_file.next_chunk()
+                        up_prog.sync_uploaded_bytes(_status.resumable_progress if _status else up_prog.total_bytes)
+                    except HttpError as err:
+                        if err.resp.get('content-type', '').startswith('application/json'):
+                            message = eval(err.content).get('error').get('errors')[0].get('message')
+                        else:
+                            message = err.error_details
+                        logger.warning(f"Retrying upload: {file_name} Reason: {message}")
+                        raise err
+                logger.info(f"Upload completed for {file_name}")
+    except RetryError as err:
+        last_err = err.last_attempt.exception()
+        err_msg = last_err.error_details if isinstance(last_err, HttpError) else str(last_err).replace('>', '').replace('>', '')
+        logger.error(f"Failed to upload: {file_name} error: {err_msg} attempts: {err.last_attempt.attempt_number}")
+        msg = f"🗂️ <b>File:</b> <code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <b>Reason:</b> <code>{err_msg}</code>"
+        if from_dir is False:
+            send_status_update(msg)
+    else:
+        drive_file = gdrive_service.files().get(fileId=response['id'], supportsAllDrives=True).execute()
+        logger.info(f"Setting permissions for {file_name}")
+        try:
+            gdrive_service.permissions().create(fileId=drive_file.get('id'), body=GDRIVE_PERM, supportsAllDrives=True).execute()
+            gdrive_service.close()
+        except HttpError:
+            pass
+        if folder_id == GDRIVE_FOLDER_ID:
+            send_status_update(f"🗂️ <b>File:</b> <code>{file_name}</code> uploaded ✔️\n🌐 <b>Link:</b> {GDRIVE_BASE_URL.format(drive_file.get('id'))}")
+            if task_data and AUTO_DEL_TASK is True:
+                task_d = task_data.split(sep="#", maxsplit=1)
+                task_id = task_d[1]
+                clear_task_files(task_id, True if task_d[0] == "qbit" else False)
 
 def is_archive_file(file_name: str) -> bool:
     if os.path.isfile(f"{DOWNLOAD_PATH}/{file_name}"):
@@ -288,7 +344,7 @@ def is_archive_file(file_name: str) -> bool:
     else:
         return False
 
-def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Optional[bool]:
+async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, chat_id: str = None) -> Optional[bool]:
     count = 0
     creds = None
     folder_id = None
@@ -322,25 +378,28 @@ def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Opt
             return
         else:
             if creds := get_oauth_creds():
-                msg_chat_dict = send_status_update(f"🗂️ <b>File: </b><code>{file_name}</code> <b>upload started</b> ⏳")
+                _chat_id = _msg_id = None
+                _size = os.stat(file_path).st_size
+                up_prog = UploadProgressUpdate()
+                msg_chat_dict = send_status_update(f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{file_name}</code>", chat_id)
+                for i in msg_chat_dict:
+                    _chat_id = msg_chat_dict[i]
+                    _msg_id = i
+                try:
+                    up_prog = UploadProgressUpdate(name=file_name, total=_size, user_id=_chat_id, stat_msg_id=_msg_id)
+                    asyncio.run_coroutine_threadsafe(coro=up_prog.trigger_update(), loop=asyncio.get_running_loop())
+                except RuntimeError:
+                    logger.warning("Failed to start upload status task")
                 if os.path.isdir(file_path) is True:
                     is_dir = True
                     if folder_id := create_folder(os.path.basename(file_path), creds):
                         for path, currentDirectory, files in os.walk(file_path):
                             for f in files:
                                 count += 1
-                                upload_file(os.path.join(path, f), folder_id, creds)
+                                await asyncio.to_thread(upload_file, os.path.join(path, f), folder_id, creds, None, True, up_prog)
                 else:
-                    upload_file(file_path, GDRIVE_FOLDER_ID, creds, task_id)
-    except RetryError as err:
-        if isinstance(err.last_attempt.exception(), HttpError):
-            reason = str(err.last_attempt.exception().error_details)
-        else:
-            reason = str(err)
-        msg = f"🗂️ <b>File:</b> <code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <b>Reason:</b> <code>{reason.replace('>', '').replace('<', '')}</code>"
-        logger.warning(f"Upload failed for: {file_name} Total attempts: {err.last_attempt.attempt_number}")
-        if is_dir is False:
-            send_status_update(msg)
+                    await asyncio.to_thread(upload_file, file_path, GDRIVE_FOLDER_ID, creds, task_id, False, up_prog)
+                up_prog.stat_msg_id = None
     except (aria2p.ClientException, OSError, AttributeError):
         logger.error("Failed to complete download event task")
     except qbittorrentapi.exceptions.NotFound404Error:
@@ -348,102 +407,104 @@ def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None) -> Opt
     if is_dir is True and folder_id is not None:
         if count == count_uploaded_files(creds=creds, folder_id=folder_id):
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: </b>{GDRIVE_FOLDER_BASE_URL.format(folder_id)}")
-            if AUTO_DEL_TASK:
-                if gid is not None:
-                    clear_task_files(gid, False)
-                if hash is not None:
-                    clear_task_files(hash, True)
+            if AUTO_DEL_TASK is True:
+                _args = (gid, False) if gid else (hash, True) if hash else (None, False)
+                clear_task_files(*_args)
             task_done = True
         else:
             delete_empty_folder(folder_id, creds)
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <i>Please check the log for more details using</i> <code>/{LOG_CMD}</code>")
     for msg_id in msg_chat_dict:
-        delete_msg(msg_id, msg_chat_dict[msg_id])
+        await delete_msg(msg_id, msg_chat_dict[msg_id])
     return task_done
 
-async def tg_upload_progress(current: int, total: int, file_name, user_id, stat_msg_id) -> None:
-    if stat_msg_id is not None:
+def get_duration(file_path: str) -> int:
+    duration = 0
+    try:
+        for stream in FFProbe(file_path).streams:
+            if stream.is_video() or stream.is_audio():
+                duration = round(stream.duration_seconds())
+                break
+    except (FFProbeError, AttributeError):
         try:
-            await pyro_app.edit_message_text(
-                chat_id=user_id, message_id=stat_msg_id,
-                text=f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(total)}</code>\n"
-                     f"⚡ <b>Processed: </b><code>{humanize.naturalsize(current)} [{round(number=current * 100 / total, ndigits=1)}%]</code>")
-        except errors.RPCError:
-            logger.warning("Failed to update upload status")
+            probe = ffmpeg.probe(file_path)
+            _stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video' or stream['codec_type'] == 'audio'), None)
+            duration = round(float(_stream.get('duration', 0)))
+        except (ffmpeg.Error, ValueError) as err:
+            logger.warning(f"probe error: {str(err)}")
+    return duration
 
 @retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=(retry_if_exception_type(errors.RPCError)))
-def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.InputMediaDocument]] = None,
-                 is_audio: bool = False, is_video: bool = False, is_photo: bool = False, thumb: str = None) -> None:
+async def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.InputMediaDocument]] = None,
+                       is_audio: bool = False, is_video: bool = False, is_photo: bool = False, thumb: str = None) -> None:
     file_name = os.path.basename(file_path)
     user_id = LEECH_CHAT_DICT[file_id] if file_id in LEECH_CHAT_DICT else None
     if pyro_app is None:
         send_status_update(f"⚠️ <b>Skip upload: </b><code>{file_name}</code>\n<b>Reason: </b>Pyrogram session is not initialized", user_id)
         return
     stat_msg_id = None
+    _file_size = 0
+    upload_progress = UploadProgressUpdate()
     if user_id is not None:
         if media_list is None:
-            msg_txt = f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(os.stat(file_path).st_size)}</code>"
+            _file_size = os.stat(file_path).st_size
+            msg_txt = f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(_file_size)}</code>"
         else:
             msg_txt = f"📤 <b>Upload started [media group]</b>\n🗂️ <b>Folder: </b><code>{file_name}</code>\n📀 <b>Total Size: </b><code>"
-            size = 0
             for media_file in media_list:
-                size += os.stat(media_file.media).st_size
-            msg_txt += f"{humanize.naturalsize(size)}</code>\n📚 <b>Total Files: </b><code>{len(media_list)}</code>"
+                _file_size += os.stat(media_file.media).st_size
+            msg_txt += f"{humanize.naturalsize(_file_size)}</code>\n📚 <b>Total Files: </b><code>{len(media_list)}</code>"
         for msg_id in send_status_update(msg_txt, user_id):
             stat_msg_id = msg_id
+        upload_progress = UploadProgressUpdate(file_name, time.time(), 0, _file_size, user_id, stat_msg_id)
     user_id = "self" if user_id is None else user_id
     logger.info(f"Tg Upload started: {file_name} [Total items: {len(media_list)}]") if media_list else logger.info(f"Tg Upload started: {file_name}")
     try:
+        asyncio.run_coroutine_threadsafe(coro=upload_progress.trigger_update(), loop=asyncio.get_running_loop())
+    except RuntimeError:
+        logger.warning("Failed to start upload status task")
+    try:
         if media_list is not None:
-            pyro_app.send_media_group(chat_id=user_id, media=media_list, disable_notification=True, protect_content=False)
+            await pyro_app.send_media_group(chat_id=user_id, media=media_list, disable_notification=True, protect_content=False)
         elif is_audio:
-            pyro_app.send_audio(chat_id=user_id, audio=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                file_name=file_name, disable_notification=True, protect_content=False, progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id))
+            await pyro_app.send_audio(chat_id=user_id, audio=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
+                                      file_name=file_name, disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes,
+                                      duration=get_duration(file_path))
         elif is_video:
-            pyro_app.send_video(chat_id=user_id, video=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                file_name=file_name, thumb=thumb, supports_streaming=True, disable_notification=True, protect_content=False,
-                                progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id))
+            await pyro_app.send_video(chat_id=user_id, video=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
+                                      file_name=file_name, thumb=thumb, supports_streaming=True, disable_notification=True, protect_content=False,
+                                      progress=upload_progress.set_processed_bytes, duration=get_duration(file_path))
         elif is_photo:
-            pyro_app.send_photo(chat_id=user_id, photo=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                disable_notification=True, protect_content=False, progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id))
+            await pyro_app.send_photo(chat_id=user_id, photo=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
+                                      disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes)
         else:
-            pyro_app.send_document(chat_id=user_id, document=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                   file_name=file_name, disable_notification=True, protect_content=False, progress=tg_upload_progress, progress_args=(file_name, user_id, stat_msg_id))
+            await pyro_app.send_document(chat_id=user_id, document=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
+                                         file_name=file_name, disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes)
         logger.info(f"Tg Upload completed: {file_name} [Total items: {len(media_list)}]") if media_list else logger.info(f"Tg Upload completed: {file_name}")
-        delete_msg(msg_id=stat_msg_id, chat_id=user_id)
+        await delete_msg(msg_id=stat_msg_id, chat_id=user_id)
     except (ValueError, FileNotFoundError) as err:
         logger.error(f"Tg Upload failed: {file_name} [{str(err)}]")
     except errors.FloodWait as err:
         logger.warning(f"Error: {err.ID}")
-        sleep(err.value)
+        await asyncio.sleep(err.value)
     except errors.RPCError as err:
         logger.error(f"Tg Upload failed: {file_name} [{err.ID}]")
         raise err
+    finally:
+        upload_progress.stat_msg_id = None
 
-def get_file_thumb(file_path: str) -> Optional[str]:
+async def get_file_thumb(file_path: str) -> Optional[str]:
     name, ext = os.path.splitext(os.path.basename(file_path))
     out_file = f"/tmp/{name}_thumb.jpg"
-    duration = 0
-    is_video = False
+    duration = get_duration(file_path)
     try:
-        for stream in FFProbe(file_path).streams:
-            if stream.is_video():
-                is_video = True
-                try:
-                    duration = stream.duration_seconds()
-                except FFProbeError:
-                    pass
-                break
-        if duration == 0 and is_video is False:
-            logger.warning(f"Unable to get thumb: {name}, reason: duration is 0")
-        else:
-            ffmpeg_proc = ffmpeg.input(file_path, ss=duration // 2 if duration >= 4 else 60).output(out_file, vframes=1).run_async(quiet=True)
-            ffmpeg_out, _ = ffmpeg_proc.communicate()
-            if os.path.exists(out_file):
-                with Image.open(out_file) as img:
-                    img.resize(size=(320, 180)).convert(mode="RGB").save(out_file, "JPEG")
-                return out_file
-    except (FFProbeError, ffmpeg.Error, UnidentifiedImageError, ValueError, TypeError, OSError) as err:
+        ffmpeg_proc = ffmpeg.input(file_path, ss=duration // 2 if duration >= 4 else 30).output(out_file, vframes=1).run_async(quiet=True)
+        ffmpeg_out, _ = ffmpeg_proc.communicate()
+        if os.path.exists(out_file):
+            with Image.open(out_file) as img:
+                img.resize(size=(320, 180)).convert(mode="RGB").save(out_file, "JPEG")
+            return out_file
+    except (ffmpeg.Error, UnidentifiedImageError, ValueError, TypeError, OSError) as err:
         logger.warning(f"Failed to get thumb for {name}{ext}[{str(err)}]")
 
 def get_file_type(file_path: str) -> Tuple[bool, bool, bool]:
@@ -458,11 +519,74 @@ def get_file_type(file_path: str) -> Tuple[bool, bool, bool]:
             is_photo = True
     return is_audio, is_video, is_photo
 
-def check_file_type_and_upload(task_id: str, file_path: str) -> None:
-    is_audio, is_video, is_photo = get_file_type(file_path)
-    upload_to_tg(task_id, file_path, is_audio=is_audio, is_video=is_video, is_photo=is_photo, thumb=get_file_thumb(file_path) if is_video else None)
+async def split_file(file_path: str, file_size: int, is_video: bool = True, is_audio: bool = False, task_id: str = None) -> List[str]:
+    _name, _ext = os.path.splitext(os.path.basename(file_path))
+    parts = math.ceil(file_size/FOUR_GB if pyro_app.me.is_premium else TWO_GB)
+    split_size = math.ceil(file_size/parts)
+    out_dir = f"{DOWNLOAD_PATH}/splits/{_name}"
+    os.makedirs(out_dir, exist_ok=True)
+    split_files_list: List[str] = []
+    user_id = LEECH_CHAT_DICT[task_id] if task_id is not None and task_id in LEECH_CHAT_DICT else None
+    err_msg = f"❗<b>Upload failed: </b><code>{_name}{_ext}</code> <b>due to error while splitting</b>\n"
+    _task_done = False
+    if is_video or is_audio:
+        i = 1
+        start_time = 0
+        orig_duration = get_duration(file_path)
+        try:
+            while i <= parts or start_time < orig_duration - 4:
+                parted_name = f"{out_dir}/{_name}.part{str(i).zfill(3)}{_ext}"
+                _pname = os.path.basename(parted_name)
+                ff_proc = ffmpeg.input(file_path, ss=start_time).output(parted_name, map_chapters=-1, fs=split_size, c="copy").run_async(quiet=True)
+                _, _ = ff_proc.communicate()
+                if os.path.exists(parted_name):
+                    processed_dur = get_duration(parted_name) - 3
+                    if processed_dur <= 0:
+                        raise ValueError(f"Split error: {_pname}[Duration is 0]")
+                    else:
+                        start_time += processed_dur
+                        split_files_list.append(parted_name)
+                        logger.info(f"Split created: {_pname}")
+                else:
+                    raise FileNotFoundError(f"Split error: {_pname}[file not generated]")
+                i += 1
+            _task_done = True
+        except (ffmpeg.Error, FileNotFoundError, ValueError) as err:
+            logger.error(f"Split error: {_name}{_ext}[{str(err)}]")
+            send_status_update(f"{err_msg}<b>Error: </b><code>{str(err)}</code>", user_id)
+    else:
+        logger.info(f"Starting to split: {_name}{_ext}")
+        _split_files: List[str] = []
+        try:
+            _split = Split(file_path, out_dir)
+            _split.manfilename = "bot_manfile"
+            _split.bysize(size=split_size, newline=True, includeheader=False)
+            _split_files.extend([f"{out_dir}/{_file}" for _file in os.listdir(out_dir) if "bot_manfile" != _file])
+            for _file in natsorted(_split_files):
+                _new_file = f"{out_dir}/{_name}{_ext}.{str(_file.split('_')[-1].split('.')[0]).zfill(3)}"
+                shutil.move(src=_file, dst=_new_file)
+                split_files_list.append(_new_file)
+            _task_done = True
+        except Exception as err:
+            logger.error(f"Split error: {_name}{_ext}[{str(err)}]")
+            send_status_update(f"{err_msg}<b>Error: </b><code>{str(err).replace('>', '').replace('>', '')}</code>", user_id)
+    if not _task_done:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        split_files_list.clear()
+    return split_files_list
 
-def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> None:
+async def check_file_type_and_upload(task_id: str, file_path: str) -> None:
+    is_audio, is_video, is_photo = get_file_type(file_path)
+    file_size = os.stat(file_path).st_size
+    if (file_size > TWO_GB and not pyro_app.me.is_premium) or (file_size > FOUR_GB and pyro_app.me.is_premium):
+        for _file in await split_file(file_path, file_size, is_video, is_audio, task_id):
+            await upload_to_tg(task_id, _file, is_audio=is_audio, is_video=is_video, is_photo=is_photo,
+                               thumb=await get_file_thumb(_file) if is_video else None)
+    else:
+        await upload_to_tg(task_id, file_path, is_audio=is_audio, is_video=is_video, is_photo=is_photo,
+                           thumb=await get_file_thumb(file_path) if is_video else None)
+
+async def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> None:
     file_name = os.path.basename(down_path)
     logger.info(f"Tg upload preparation: {file_name}")
     try:
@@ -473,7 +597,7 @@ def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> N
             files_list = natsorted(files_list)
             if in_group:
                 if files_list and len(files_list) < 2:
-                    check_file_type_and_upload(task_id, files_list[0])
+                    await check_file_type_and_upload(task_id, files_list[0])
                 else:
                     files_chunk = [files_list[i:i+10] for i in range(0, len(files_list), 10)]
                     for chunk in files_chunk:
@@ -482,29 +606,33 @@ def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False) -> N
                             is_audio, is_video, is_photo = get_file_type(file)
                             name = os.path.basename(file)
                             if is_audio:
-                                media_list.append(types.InputMediaAudio(media=file, caption=f"<code>{name}</code>", parse_mode=enums.ParseMode.HTML))
+                                media_list.append(types.InputMediaAudio(media=file, caption=f"<code>{name}</code>", parse_mode=enums.ParseMode.HTML,
+                                                                        duration=get_duration(file)))
                             elif is_video:
-                                media_list.append(types.InputMediaVideo(media=file, caption=f"<code>{name}</code>", thumb=get_file_thumb(file),
-                                                                        parse_mode=enums.ParseMode.HTML, supports_streaming=True))
+                                media_list.append(types.InputMediaVideo(media=file, caption=f"<code>{name}</code>", thumb= await get_file_thumb(file),
+                                                                        parse_mode=enums.ParseMode.HTML, supports_streaming=True, duration=get_duration(file)))
                             elif is_photo:
                                 media_list.append(types.InputMediaPhoto(media=file, caption=f"<code>{name}</code>", parse_mode=enums.ParseMode.HTML))
                             else:
                                 media_list.append(types.InputMediaDocument(media=file, caption=f"<code>{name}</code>", parse_mode=enums.ParseMode.HTML))
-                        upload_to_tg(task_id, file_name, media_list)
+                        await upload_to_tg(task_id, file_name, media_list)
             else:
                 for file in files_list:
-                    check_file_type_and_upload(task_id, file)
+                    await check_file_type_and_upload(task_id, file)
         else:
             if os.stat(down_path).st_size == 0:
                 logger.warning(f"Skip upload: {file_name}, reason: empty file")
-            check_file_type_and_upload(task_id, down_path)
+            else:
+                await check_file_type_and_upload(task_id, down_path)
     except (RetryError, FileNotFoundError) as err:
         logger.error(f"Tg Upload failed: {file_name}, attempts: {err.last_attempt.attempt_number if isinstance(err, RetryError) else f'[{str(err)}]'}")
         send_status_update(f"❗<b>Upload failed: </b><code>{file_name}</code>\n<i>Check log for more details</i>",
                            LEECH_CHAT_DICT[task_id] if task_id in LEECH_CHAT_DICT else None)
     else:
-        logger.info(f"Cleaning up: {file_name}")
-        shutil.rmtree(path=down_path, ignore_errors=True)
+        if AUTO_DEL_TASK is True:
+            logger.info(f"Cleaning up: {file_name}")
+            shutil.rmtree(path=down_path, ignore_errors=True)
+            shutil.rmtree(path=f"{DOWNLOAD_PATH}/splits/{os.path.splitext(file_name)[0]}", ignore_errors=True)
 
 def get_user(update: Update) -> Union[str, int]:
     return update.message.from_user.name if update.message.from_user.name is not None else update.message.chat_id
@@ -516,11 +644,6 @@ def get_download_info(down: aria2p.Download) -> str:
     if down.bittorrent is not None:
         info += f"\n🥑 <b>Seeders:</b> <code>{down.num_seeders}</code>"
     info += f"\n⚙️ <b>Engine: </b><code>Aria2</code>\n📚 <b>Total Files:</b> <code>{len(down.files)}</code>\n"
-    # if len(down.files) > 1:
-    #     for aria_file in down.files:
-    #         if aria_file.is_metadata is True:
-    #             continue
-    #         info += f"📄 {os.path.basename(aria_file.path.name)} <code>[{aria_file.completed_length_string()}/{aria_file.length_string()}]</code>\n"
     return info
 
 def get_qbit_info(hash: str, client: qbittorrentapi.Client = None) -> str:
@@ -532,9 +655,6 @@ def get_qbit_info(hash: str, client: qbittorrentapi.Client = None) -> str:
             f"⚡ <b>Speed:</b> <code>{humanize.naturalsize(torrent.dlspeed)}/s</code> ⏳ <b>ETA:</b> <code>{humanize.naturaldelta(torrent.eta)}</code>\n⚙️ <b>Engine: </b><code>Qbittorent</code>"
         try:
             info += f"\n📚 <b>Total Files:</b> <code>{len(client.torrents_files(torrent_hash=hash))}</code>\n"
-            # if len(client.torrents_files(torrent_hash=hash)) > 1:
-            #     for torrent_file in client.torrents_files(torrent_hash=hash):
-            #         info += f"📄 {os.path.basename(torrent_file.get('name'))} <code>[{round(number=torrent_file.get('progress') * 100, ndigits=1)}%|{humanize.naturalsize(torrent_file.get('size'))}]</code>\n"
         except qbittorrentapi.exceptions.NotFound404Error:
             pass
     return info
@@ -694,8 +814,9 @@ def get_sys_info() -> str:
               f"<b>Network IO:</b> 🔻 {humanize.naturalsize(psutil.net_io_counters().bytes_recv)} 🔺 {humanize.naturalsize(psutil.net_io_counters().bytes_sent)}"
     try:
         details += f"\n<b>Bot Uptime:</b> {humanize.naturaltime(time.time() - BOT_START_TIME)}"
+        details += f"\n<b>Async Tasks:</b> {len(asyncio.all_tasks(asyncio.get_running_loop()))}"
         details += f"\n<b>Ngrok URL:</b> {ngrok.get_tunnels()[0].public_url}"
-    except (OverflowError, IndexError, ngrok.PyngrokError):
+    except (OverflowError, IndexError, ngrok.PyngrokError, RuntimeError):
         pass
     return details
 
@@ -712,8 +833,12 @@ async def trigger_upload(name: str, prog: str, file_id: str, update: Update, ori
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
     else:
         msg = f"🌈 <b>Upload started for: </b><code>{name}</code>\n⚠️ <i>Do not press the upload button again unless the upload has failed, you'll receive status updates on the same</i>"
-        threading.Thread(target=upload_to_gdrive, kwargs={'name': name}, daemon=True).start()
-        logger.info(f"Upload thread started for: {name}")
+        try:
+            asyncio.run_coroutine_threadsafe(upload_to_gdrive(name=name, chat_id=str(update.callback_query.message.chat_id)), asyncio.get_running_loop())
+            logger.info(f"Upload thread started for: {name}")
+        except RuntimeError:
+            logger.info(f"Failed to start upload thread for: {name}")
+            msg = f"⁉️<b>Failed to initiate upload for: </b><code>{name}</code>\n⚠️ <i>Please tap on the back button and retry</i>"
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
 
 def is_file_extracted(file_name: str) -> bool:
@@ -746,7 +871,10 @@ async def start_extraction(name: str, prog: str, file_id: str, update: Update, u
                 msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(folder_name)}"
             send_status_update(msg)
             if upload is True:
-                threading.Thread(target=upload_to_gdrive, kwargs={'name': folder_name}, daemon=True).start()
+                try:
+                    asyncio.run_coroutine_threadsafe(upload_to_gdrive(name=folder_name, chat_id=str(update.callback_query.message.chat_id)), asyncio.get_running_loop())
+                except RuntimeError:
+                    logger.info(f"Failed to start upload thread for: {folder_name}")
         except patoolib.util.PatoolError as err:
             shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
             send_status_update(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n<i>Check /{LOG_CMD} for more details.</i>")
@@ -860,7 +988,7 @@ async def ngrok_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         try:
             if ngrok.process.is_process_running(conf.get_default().ngrok_path) is True:
                 ngrok.kill()
-                await sleep(1)
+                await asyncio.sleep(1)
             file_tunnel = ngrok.connect(addr=f"file://{DOWNLOAD_PATH}", proto="http", schemes=["http"], name="files_tunnel", inspect=False)
             await reply_message(f"🌍 <b>Ngrok tunnel started\nURL:</b> {file_tunnel.public_url}", update, context)
         except ngrok.PyngrokError as err:
@@ -918,7 +1046,8 @@ async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAU
                     )
     return tg_file_path, tg_msg
 
-def extract_upload_tg_file(file_path: str, upload: bool = False, leech: bool = False, task_id: str = "", in_group: bool = False) -> None:
+async def extract_upload_tg_file(file_path: str, upload: bool = False, leech: bool = False, task_id: str = "",
+                                 in_group: bool = False, chat_id: str = None) -> None:
     if os.path.exists(file_path) is False or os.path.isdir(file_path) is True:
         return
     name = os.path.basename(file_path)
@@ -930,16 +1059,17 @@ def extract_upload_tg_file(file_path: str, upload: bool = False, leech: bool = F
         if not upload and not leech:
             if tunnel := ngrok.get_tunnels():
                 msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(folder_name)}"
-        send_status_update(msg)
-        if upload is True and upload_to_gdrive(name=folder_name) is True:
+        send_status_update(msg, chat_id)
+        if upload is True and await upload_to_gdrive(name=folder_name, chat_id=chat_id) is True:
             logger.info(f"Cleaning up: {name}")
             shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
             os.remove(file_path)
         if leech is True:
-            trigger_tg_upload(f"{DOWNLOAD_PATH}/{folder_name}", task_id, in_group)
+            await trigger_tg_upload(f"{DOWNLOAD_PATH}/{folder_name}", task_id, in_group)
     except patoolib.util.PatoolError as err:
         shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
-        send_status_update(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n<i>Check /{LOG_CMD} for more details.</i>")
+        send_status_update(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n"
+                           f"<i>Check /{LOG_CMD} for more details.</i>", chat_id)
 
 async def is_torrent_file(doc: Document, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
     logger.info(f"Fetching file: {doc.file_name}")
@@ -1000,8 +1130,16 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
                         up_args = {"upload": True, "leech": False}
                     up_args["file_path"] = file_path
                     up_args["task_id"] = reply_doc.file_id
+                    up_args["chat_id"] = update.message.chat_id
                     LEECH_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
-                    threading.Thread(target=extract_upload_tg_file, kwargs=up_args, daemon=True).start()
+                    try:
+                        asyncio.run_coroutine_threadsafe(extract_upload_tg_file(**up_args), asyncio.get_running_loop())
+                    except RuntimeError:
+                        logger.error(f"Failed to call extract_upload_tg_file() for: {reply_doc.file_name}")
+                        if tg_msg is not None:
+                            await context.bot.edit_message_text(
+                                text=f"⁉️<b>File: </b><code>{reply_doc.file_name}</code> <b>unable to initiate file extraction, please retry</b>",
+                                chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML)
                 else:
                     await reply_message(f"❗<b>Given file type not supported, please send a torrent/archive file.</b>", update, context)
             elif reply_text := reply_msg.text:
@@ -1112,109 +1250,126 @@ async def qbit_mirror_leech(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def aria_unzip_leech(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await aria_upload(update, context, True, True)
 
-def extract_and_upload(torrent: Union[aria2p.Download, qbittorrentapi.TorrentDictionary], upload: bool = True, leech: bool = False, in_group: bool = False) -> None:
+async def extract_and_upload(torrent: Union[aria2p.Download, qbittorrentapi.TorrentDictionary], upload: bool = True,
+                             leech: bool = False, in_group: bool = False) -> None:
     if isinstance(torrent, qbittorrentapi.TorrentDictionary):
         file_name = torrent.files[0].get('name').split("/")[0] if torrent.files else torrent.get('name')
         file_id = torrent.get('hash')
     else:
         file_name = torrent.name
         file_id = torrent.gid
+    chat_id = LEECH_CHAT_DICT[file_id] if file_id in LEECH_CHAT_DICT else None
     if is_archive_file(file_name):
         if is_file_extracted(file_name):
             msg = f"🗂️ <b>File:</b> <code>{file_name}</code> is already <b>extracted</b> ✔️"
-            send_status_update(msg)
+            send_status_update(msg, chat_id)
         else:
             folder_name = os.path.splitext(file_name)[0]
             os.makedirs(name=f"{DOWNLOAD_PATH}/{folder_name}", exist_ok=True)
             try:
                 patoolib.extract_archive(archive=f"{DOWNLOAD_PATH}/{file_name}", outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
                 msg = f"🗂️ <b>File:</b> <code>{file_name}</code> <b>extracted</b> ✔️"
-                send_status_update(msg)
+                send_status_update(msg, chat_id)
             except patoolib.util.PatoolError as err:
                 shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
                 send_status_update(f"⁉️<b>Failed to extract:</b> <code>{file_name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n"
-                                   f"<i>Check /{LOG_CMD} for more details.</i>")
+                                   f"<i>Check /{LOG_CMD} for more details.</i>", chat_id)
             else:
-                if upload and upload_to_gdrive(name=folder_name):
-                    clear_task_files(file_id, isinstance(torrent, qbittorrentapi.TorrentDictionary))
+                if upload and await upload_to_gdrive(name=folder_name, chat_id=chat_id):
+                    if AUTO_DEL_TASK is True:
+                        clear_task_files(file_id, isinstance(torrent, qbittorrentapi.TorrentDictionary))
                 if leech:
-                    trigger_tg_upload(f"{DOWNLOAD_PATH}/{folder_name}", file_id, in_group)
+                    await trigger_tg_upload(f"{DOWNLOAD_PATH}/{folder_name}", file_id, in_group)
 
-def trigger_extract_upload(torrent: Union[aria2p.Download, qbittorrentapi.TorrentDictionary], task_id: str) -> None:
+async def trigger_extract_upload(torrent: Union[aria2p.Download, qbittorrentapi.TorrentDictionary], task_id: str) -> None:
     if task_id in UPLOAD_MODE_DICT:
         upload_mode = UPLOAD_MODE_DICT.get(task_id)
         up_arg = {'gid': task_id} if isinstance(torrent, aria2p.Download) else {'hash': task_id}
+        up_arg['chat_id'] = LEECH_CHAT_DICT[task_id] if task_id in LEECH_CHAT_DICT else None
         if isinstance(torrent, qbittorrentapi.TorrentDictionary):
             file_name = torrent.files[0].get('name').split("/")[0] if torrent.files else torrent.get('name')
         else:
             file_name = torrent.name
-        if upload_mode == "A":
-            threading.Thread(target=upload_to_gdrive, kwargs=up_arg, daemon=True).start()
-        elif upload_mode == "E":
-            threading.Thread(target=extract_and_upload, kwargs={'torrent': torrent}, daemon=True).start()
-        elif upload_mode == "ME":
-            threading.Thread(target=extract_and_upload, kwargs={'torrent': torrent, 'upload': False}, daemon=True).start()
-        elif upload_mode == "L":
-            threading.Thread(target=trigger_tg_upload, args=(f"{DOWNLOAD_PATH}/{file_name}", task_id), daemon=True).start()
-        elif upload_mode == "LG":
-            threading.Thread(target=trigger_tg_upload, args=(f"{DOWNLOAD_PATH}/{file_name}", task_id, True), daemon=True).start()
-        elif upload_mode == "EL":
-            threading.Thread(target=extract_and_upload, kwargs={'torrent': torrent, 'upload': False, 'leech': True}, daemon=True).start()
-        elif upload_mode == "ELG":
-            threading.Thread(target=extract_and_upload, kwargs={'torrent': torrent, 'upload': False, 'leech': True, 'in_group': True}, daemon=True).start()
-        else:
-            logger.info(f"Nothing needs to be done for: {task_id}")
+        try:
+            loop = asyncio.get_running_loop()
+            if upload_mode == "A":
+                asyncio.run_coroutine_threadsafe(upload_to_gdrive(**up_arg), loop)
+            elif upload_mode == "E":
+                asyncio.run_coroutine_threadsafe(extract_and_upload(torrent=torrent), loop)
+            elif upload_mode == "ME":
+                asyncio.run_coroutine_threadsafe(extract_and_upload(torrent=torrent, upload=False), loop)
+            elif upload_mode == "L":
+                asyncio.run_coroutine_threadsafe(trigger_tg_upload(f"{DOWNLOAD_PATH}/{file_name}", task_id), loop)
+            elif upload_mode == "LG":
+                asyncio.run_coroutine_threadsafe(trigger_tg_upload(f"{DOWNLOAD_PATH}/{file_name}", task_id, True), loop)
+            elif upload_mode == "EL":
+                asyncio.run_coroutine_threadsafe(extract_and_upload(torrent=torrent, upload=False, leech=True), loop)
+            elif upload_mode == "ELG":
+                asyncio.run_coroutine_threadsafe(extract_and_upload(torrent=torrent, upload=False, leech=True, in_group=True), loop)
+            else:
+                logger.info(f"Nothing needs to be done for: {task_id}")
+        except RuntimeError:
+            logger.error("Failed to start thetrigger")
 
-def aria_listener(api: aria2p.API = None, gid: str = None) -> None:
-    logger.info("aria download complete event trigger")
+async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
+    total_downloads: List[Union[aria2p.Download, qbittorrentapi.TorrentDictionary]] = []
+    ngrok_url = None
     try:
-        down = aria2c.get_download(gid)
-        if not down.is_metadata and not down.followed_by_ids:
-            msg = f"✅ <b>Downloaded: </b><code>{down.name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(down.total_length)}</code>"
-            if tunnel := ngrok.get_tunnels():
-                msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(down.name)}"
-            send_status_update(msg)
-            trigger_extract_upload(down, gid)
-        else:
-            for fgid in down.followed_by_ids:
-                UPLOAD_MODE_DICT[fgid] = UPLOAD_MODE_DICT.get(gid) if gid in UPLOAD_MODE_DICT else "M"
-                LEECH_CHAT_DICT[fgid] = LEECH_CHAT_DICT.get(gid) if gid in LEECH_CHAT_DICT else None
-            logger.info(f"Removing file: {down.name}")
-            aria2c.remove(downloads=[down])
-    except aria2p.ClientException as err:
-        logger.error(f"Error in aria listener: {str(err)}")
-
-def qbit_listener() -> None:
-    logger.info("Starting qbit download event listener")
-    while True:
-        if qb_client := get_qbit_client():
-            try:
-                for torrent in qb_client.torrents_info(status_filter="all"):
+        if tunnel := ngrok.get_tunnels():
+            ngrok_url = f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/ngrok_url"
+    except ngrok.PyngrokError:
+        pass
+    if qb_client := get_qbit_client():
+        try:
+            total_downloads.extend([torrent for torrent in qb_client.torrents_info(status_filter="all")])
+            total_downloads.extend([down for down in aria2c.get_downloads()])
+            for torrent in total_downloads:
+                if isinstance(torrent, qbittorrentapi.TorrentDictionary):
                     present_in_dict = torrent.get('hash') in QBIT_STATUS_DICT
                     if torrent.state_enum.is_complete or "pausedUP" == torrent.state_enum.value:
                         if present_in_dict:
                             if QBIT_STATUS_DICT.get(torrent.get('hash')) == "NOT_SENT":
                                 msg = f"✅ <b>Downloaded: </b><code>{torrent.get('name')}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(torrent.get('size'))}</code>\n" \
                                       f"⏳ <b>Time taken: </b><code>{humanize.naturaldelta(torrent.get('completion_on') - torrent.get('added_on'))}</code>"
-                                if tunnel := ngrok.get_tunnels():
-                                    file_name = torrent.files[0].get('name').split("/")[0] if torrent.files else torrent.get('name')
-                                    msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(file_name)}"
+                                file_name = torrent.files[0].get('name').split("/")[0] if torrent.files else torrent.get('name')
+                                if ngrok_url is not None:
+                                    msg += ngrok_url.replace("ngrok_url", quote(file_name))
                                 send_status_update(msg)
                                 QBIT_STATUS_DICT[torrent.get('hash')] = "SENT"
-                                trigger_extract_upload(torrent, torrent.get('hash'))
-                        else:
-                            QBIT_STATUS_DICT[torrent.get('hash')] = "NOT_SENT"
+                                asyncio.run_coroutine_threadsafe(coro=trigger_extract_upload(torrent, torrent.get('hash')), loop=asyncio.get_running_loop())
                     if torrent.state_enum.is_errored:
                         if present_in_dict:
                             if QBIT_STATUS_DICT.get(torrent.get('hash')) == "NOT_SENT":
-                                send_status_update(f"❌ <b>Failed: </b><code>{torrent.get('name')}</code>")
+                                send_status_update(f"❌ <b>Failed to download: </b><code>{torrent.get('name')}</code>")
                                 QBIT_STATUS_DICT[torrent.get('hash')] = "SENT"
+                    if not present_in_dict:
+                        QBIT_STATUS_DICT[torrent.get('hash')] = "NOT_SENT"
+                else:
+                    down = torrent
+                    if down.is_complete:
+                        if not down.is_metadata and not down.followed_by_ids:
+                            if down.gid in QBIT_STATUS_DICT and QBIT_STATUS_DICT[down.gid] == "NOT_SENT":
+                                msg = f"✅ <b>Downloaded: </b><code>{down.name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(down.total_length)}</code>"
+                                if ngrok_url is not None:
+                                    msg += ngrok_url.replace("ngrok_url", quote(down.name))
+                                send_status_update(msg)
+                                QBIT_STATUS_DICT[down.gid] = "SENT"
+                                asyncio.run_coroutine_threadsafe(coro=trigger_extract_upload(down, down.gid), loop=asyncio.get_running_loop())
                         else:
-                            QBIT_STATUS_DICT[torrent.get('hash')] = "NOT_SENT"
-            except qbittorrentapi.APIConnectionError:
-                logger.warning("Error in qbit listener [APIConnectionError]")
+                            for fgid in down.followed_by_ids:
+                                UPLOAD_MODE_DICT[fgid] = UPLOAD_MODE_DICT.get(down.gid) if down.gid in UPLOAD_MODE_DICT else "M"
+                                LEECH_CHAT_DICT[fgid] = LEECH_CHAT_DICT.get(down.gid) if down.gid in LEECH_CHAT_DICT else None
+                            logger.info(f"Removing file: {down.name}")
+                            aria2c.remove(downloads=[down])
+                    if down.has_failed:
+                        if down.gid in QBIT_STATUS_DICT and QBIT_STATUS_DICT[down.gid] == "NOT_SENT":
+                            send_status_update(f"⁉️<b>Failed to download: </b><code>{down.name}</code> [{down.error_message}]")
+                            QBIT_STATUS_DICT[down.gid] = "SENT"
+                    if down.gid not in QBIT_STATUS_DICT:
+                        QBIT_STATUS_DICT[down.gid] = "NOT_SENT"
             qb_client.auth_log_out()
-        time.sleep(10)
+        except (qbittorrentapi.APIConnectionError, aria2p.ClientException, RuntimeError) as err:
+            logger.warning(f"Error in aria qbit listener [{str(err)}]")
 
 def start_bot() -> None:
     global BOT_START_TIME
@@ -1242,6 +1397,7 @@ def start_bot() -> None:
             callback_handler = CallbackQueryHandler(bot_callback_handler, pattern="^aria|qbit|sys")
             application.add_handlers([start_handler, aria_handler, callback_handler, status_handler, info_handler, log_handler,
                                       qbit_handler, ngrok_handler, unzip_aria, unzip_qbit, leech_aria, leech_qbit, unzip_leech_aria])
+            application.job_queue.run_repeating(callback=aria_qbit_listener, interval=15, name="aria_qbit_listener")
             application.run_polling(drop_pending_updates=True)
         except error.TelegramError as err:
             logger.error(f"Failed to start bot: {str(err)}")
@@ -1259,7 +1415,9 @@ def start_pyrogram() -> None:
             parse_mode=enums.ParseMode.HTML,
             bot_token=os.environ["BOT_TOKEN"] if not sess_str else None,
             session_string=sess_str if sess_str else None,
-            in_memory=True if sess_str else None
+            in_memory=True if sess_str else None,
+            takeout=True,
+            max_concurrent_transmissions=10
         )
         pyro_app.start()
         logger.info(f"Session started, premium: {pyro_app.me.is_premium}")
@@ -1325,7 +1483,6 @@ def start_aria() -> None:
         subprocess.run(args=aria_command_args, check=True)
         time.sleep(2)
         aria2c = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
-        aria2c.listen_to_notifications(threaded=True, on_download_complete=aria_listener)
         aria2c.get_downloads()
         logger.info("aria2c daemon started")
     except (subprocess.CalledProcessError, aria2p.client.ClientException, requests.exceptions.RequestException, OSError) as err:
@@ -1346,7 +1503,6 @@ def start_qbit() -> None:
         qb_client = get_qbit_client()
         logger.info(f"qbittorrent version: {qb_client.app.version}")
         qb_client.auth_log_out()
-        threading.Thread(target=qbit_listener, daemon=False).start()
     except (subprocess.CalledProcessError, AttributeError, qbittorrentapi.exceptions.APIConnectionError,
             qbittorrentapi.exceptions.LoginFailed) as err:
         logger.error(f"Failed to start qbittorrent-nox, error: {str(err)}")
