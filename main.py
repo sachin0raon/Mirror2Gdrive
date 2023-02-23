@@ -219,7 +219,7 @@ def delete_empty_folder(folder_id: str, creds = None) -> None:
             logger.warning(f"Failed to delete folder: {folder_id}")
 
 def remove_extracted_dir(file_name: str) -> None:
-    if is_archive_file(file_name) and os.path.exists(f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}"):
+    if os.path.exists(f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}"):
         shutil.rmtree(path=f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}", ignore_errors=True)
 
 def clear_task_files(task_id: str = None, is_qbit: bool = False) -> None:
@@ -493,7 +493,6 @@ async def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[t
             await pyro_app.send_document(chat_id=user_id, document=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
                                          file_name=file_name, disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes)
         logger.info(f"Tg Upload completed: {file_name} [Total items: {len(media_list)}]") if media_list else logger.info(f"Tg Upload completed: {file_name}")
-        await delete_msg(msg_id=stat_msg_id, chat_id=user_id)
     except (ValueError, FileNotFoundError) as err:
         logger.error(f"Tg Upload failed: {file_name} [{str(err)}]")
     except errors.FloodWait as err:
@@ -504,6 +503,7 @@ async def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[t
         raise err
     finally:
         upload_progress.stat_msg_id = None
+        await delete_msg(msg_id=stat_msg_id, chat_id=user_id)
 
 async def get_file_thumb(file_path: str) -> Optional[str]:
     name, ext = os.path.splitext(os.path.basename(file_path))
@@ -645,6 +645,7 @@ async def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False
             logger.info(f"Cleaning up: {file_name}")
             shutil.rmtree(path=down_path, ignore_errors=True)
             shutil.rmtree(path=f"{DOWNLOAD_PATH}/splits/{os.path.splitext(file_name)[0]}", ignore_errors=True)
+            clear_task_files(task_id)
 
 def get_user(update: Update) -> Union[str, int]:
     return update.message.from_user.name if update.message.from_user.name is not None else update.message.chat_id
