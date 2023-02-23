@@ -691,6 +691,15 @@ def get_ngrok_btn(file_name: str) -> Optional[InlineKeyboardButton]:
         logger.error(f"Failed to get ngrok tunnel")
         return None
 
+def get_ngrok_file_url(file_name: str) -> str:
+    _url = ''
+    try:
+        if tunnels := ngrok.get_tunnels():
+            _url += f"\n🌎 <b>URL: </b>{tunnels[0].public_url}/{quote(file_name)}"
+    except ngrok.PyngrokError:
+        logger.debug(f"Failed to get ngrok url for: {file_name}")
+    return _url
+
 def get_buttons(prog: str, dl_info: str) -> Dict[str, InlineKeyboardButton]:
     return {
         "refresh": InlineKeyboardButton(text="♻ Refresh", callback_data=f"{prog}-refresh#{dl_info}"),
@@ -867,9 +876,7 @@ def is_file_extracted(file_name: str) -> bool:
 async def start_extraction(name: str, prog: str, file_id: str, update: Update, upload: bool = False) -> None:
     folder_name = os.path.splitext(name)[0]
     if is_file_extracted(name):
-        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already extracted</b>"
-        if tunnel := ngrok.get_tunnels():
-            msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(folder_name)}"
+        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already extracted</b>{get_ngrok_file_url(folder_name)}"
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
     else:
         msg = f"🗃️ <b>Extraction started for: </b><code>{name}</code>\n⚠️ <i>Do not press the extract button again unless it has failed, you'll receive status updates on the same.</i>"
@@ -879,9 +886,7 @@ async def start_extraction(name: str, prog: str, file_id: str, update: Update, u
         os.makedirs(name=f"{DOWNLOAD_PATH}/{folder_name}", exist_ok=True)
         try:
             patoolib.extract_archive(archive=f"{DOWNLOAD_PATH}/{name}", outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
-            msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️"
-            if tunnel := ngrok.get_tunnels():
-                msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(folder_name)}"
+            msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️{get_ngrok_file_url(folder_name)}"
             send_status_update(msg)
             if upload is True:
                 try:
@@ -1051,6 +1056,7 @@ async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAU
             logger.error(f"Given file: {doc.file_name} does not exist in telegram server or may be timeout error while downloading")
         else:
             if tg_file_path is not None and os.path.exists(tg_file_path):
+                logger.info(f"Downloaded file from TG: {doc.file_name}")
                 if tg_msg is not None:
                     tg_msg = await context.bot.edit_message_text(
                         text=f"<b>File: </b><code>{doc.file_name}</code> <b>is downloaded, starting further process</b>",
@@ -1059,19 +1065,19 @@ async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAU
     return tg_file_path, tg_msg
 
 async def extract_upload_tg_file(file_path: str, upload: bool = False, leech: bool = False, task_id: str = "",
-                                 in_group: bool = False, chat_id: str = None) -> None:
+                                 in_group: bool = False, chat_id: str = None, extract: bool = True) -> None:
     if os.path.exists(file_path) is False or os.path.isdir(file_path) is True:
         return
     name = os.path.basename(file_path)
-    folder_name = os.path.splitext(name)[0]
-    os.makedirs(name=f"{DOWNLOAD_PATH}/{folder_name}", exist_ok=True)
+    folder_name = os.path.splitext(name)[0] if extract else name
     try:
-        patoolib.extract_archive(archive=file_path, outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
-        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️"
-        if not upload and not leech:
-            if tunnel := ngrok.get_tunnels():
-                msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(folder_name)}"
-        await send_msg_async(msg, chat_id)
+        if extract:
+            os.makedirs(name=f"{DOWNLOAD_PATH}/{folder_name}", exist_ok=True)
+            patoolib.extract_archive(archive=file_path, outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
+            msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️"
+            if not upload and not leech:
+                msg += get_ngrok_file_url(folder_name)
+            await send_msg_async(msg, chat_id)
         if upload is True and await upload_to_gdrive(name=folder_name, chat_id=chat_id) is True:
             logger.info(f"Cleaning up: {name}")
             shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
@@ -1082,12 +1088,35 @@ async def extract_upload_tg_file(file_path: str, upload: bool = False, leech: bo
         shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
         await send_msg_async(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n"
                              f"<i>Check /{LOG_CMD} for more details.</i>", chat_id)
+    finally:
+        if AUTO_DEL_TASK is True:
+            shutil.rmtree(file_path, ignore_errors=True)
 
 async def is_torrent_file(doc: Document, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
     logger.info(f"Fetching file: {doc.file_name}")
     tg_file = await context.bot.get_file(file_id=doc.file_id)
     tg_file_path = await tg_file.download_to_drive(custom_path=f"/tmp/{tg_file.file_id}")
     return tg_file_path if magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent" else None
+
+async def get_upload_mode(cmd_txt: List[str], unzip: bool, leech: bool) -> str:
+    if len(cmd_txt) > 1:
+        if re.search("^-M", cmd_txt[1], re.IGNORECASE):
+            upload_mode = "ME" if unzip else "M"
+        elif re.search("^-G", cmd_txt[1], re.IGNORECASE):
+            upload_mode = "ELG" if unzip and leech else "E" if unzip else "LG" if leech else "A"
+        elif unzip:
+            upload_mode = "EL" if leech else "E"
+        elif leech:
+            upload_mode = "L"
+        else:
+            upload_mode = "A"
+    elif unzip:
+        upload_mode = "EL" if leech else "E"
+    elif leech:
+        upload_mode = "L"
+    else:
+        upload_mode = "A"
+    return upload_mode
 
 async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip: bool = False, leech: bool = False) -> None:
     logger.info(f"/{MIRROR_CMD if not unzip else UNZIP_ARIA_CMD} sent by {get_user(update)}")
@@ -1098,23 +1127,7 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
                f"<i>Send /{LEECH_ARIA_CMD} -g or /{UNZIP_LEECH_CMD} -g to leech files as a media group</i>"
     try:
         cmd_txt = update.message.text.strip().split(" ", maxsplit=1)
-        if len(cmd_txt) > 1:
-            if re.search("^-M", cmd_txt[1], re.IGNORECASE):
-                upload_mode = "ME" if unzip else "M"
-            elif re.search("^-G", cmd_txt[1], re.IGNORECASE):
-                upload_mode = "ELG" if unzip and leech else "E" if unzip else "LG" if leech else "A"
-            elif unzip:
-                upload_mode = "EL" if leech else "E"
-            elif leech:
-                upload_mode = "L"
-            else:
-                upload_mode = "A"
-        elif unzip:
-            upload_mode = "EL" if leech else "E"
-        elif leech:
-            upload_mode = "L"
-        else:
-            upload_mode = "A"
+        upload_mode = await get_upload_mode(cmd_txt, unzip, leech)
         if reply_msg := update.message.reply_to_message:
             if reply_doc := reply_msg.document:
                 tg_file_path, tg_msg = await get_tg_file(reply_doc, update, context)
@@ -1127,33 +1140,36 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
                 elif magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent":
                     logger.info(f"Adding file to download: {reply_doc.file_name}")
                     aria_obj = aria2c.add_torrent(torrent_file_path=tg_file_path)
-                elif magic.from_file(tg_file_path, mime=True) in ArchiveMimetypes:
-                    file_path = f"{DOWNLOAD_PATH}/{reply_doc.file_name}"
-                    if tg_msg is not None:
-                        await context.bot.edit_message_text(text=f"<b>File: </b><code>{reply_doc.file_name}</code> <b>extraction started</b>",
-                                                            chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML)
-                    shutil.move(src=tg_file_path, dst=file_path)
-                    if "L" in upload_mode:
-                        in_group = True if "G" in upload_mode else False
-                        up_args = {"upload": False, "leech": True, "in_group": in_group}
-                    elif "M" in upload_mode:
-                        up_args = {"upload": False, "leech": False}
-                    else:
-                        up_args = {"upload": True, "leech": False}
-                    up_args["file_path"] = file_path
-                    up_args["task_id"] = reply_doc.file_id
-                    up_args["chat_id"] = update.message.chat_id
-                    LEECH_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
+                else:
                     try:
-                        asyncio.run_coroutine_threadsafe(extract_upload_tg_file(**up_args), asyncio.get_running_loop())
+                        _loop = asyncio.get_running_loop()
                     except RuntimeError:
                         logger.error(f"Failed to call extract_upload_tg_file() for: {reply_doc.file_name}")
                         if tg_msg is not None:
                             await context.bot.edit_message_text(
-                                text=f"⁉️<b>File: </b><code>{reply_doc.file_name}</code> <b>unable to initiate file extraction, please retry</b>",
+                                text=f"⁉️<b>File: </b><code>{reply_doc.file_name}</code> <b>was downloaded but failed to initiate further process, please retry</b>",
                                 chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML)
-                else:
-                    await reply_message(f"❗<b>Given file type not supported, please send a torrent/archive file.</b>", update, context)
+                    else:
+                        file_path = f"{DOWNLOAD_PATH}/{reply_doc.file_name}"
+                        shutil.move(src=tg_file_path, dst=file_path)
+                        if "L" in upload_mode:
+                            in_group = True if "G" in upload_mode else False
+                            up_args = {"upload": False, "leech": True, "in_group": in_group}
+                        elif "M" in upload_mode:
+                            up_args = {"upload": False, "leech": False}
+                        else:
+                            up_args = {"upload": True, "leech": False}
+                        up_args["extract"] = True if "E" in upload_mode and magic.from_file(file_path, mime=True) in ArchiveMimetypes else False
+                        up_args["file_path"] = file_path
+                        up_args["task_id"] = reply_doc.file_id
+                        up_args["chat_id"] = update.message.chat_id
+                        LEECH_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
+                        if tg_msg is not None and not any([up_args['extract'], up_args['upload'], up_args['leech']]):
+                            await context.bot.edit_message_text(
+                                text=f"<b>File: </b><code>{reply_doc.file_name}</code> <b>is saved, use ngrok url to access</b>{get_ngrok_file_url(reply_doc.file_name)}",
+                                chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML)
+                        logger.info(f"calling extract_upload_tg_file() with {up_args}")
+                        asyncio.run_coroutine_threadsafe(extract_upload_tg_file(**up_args), _loop)
             elif reply_text := reply_msg.text:
                 link = reply_text
             else:
@@ -1183,7 +1199,7 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
         await reply_message(help_txt, update, context)
     except aria2p.ClientException:
         await reply_message("❗ <b>Failed to start download, kindly check the link and retry.</b>", update, context)
-    except error.TelegramError:
+    except (error.TelegramError, FileNotFoundError):
         await reply_message("❗<b>Failed to process the given file</b>", update, context)
 
 async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip: bool = False, leech: bool = False) -> None:
@@ -1196,23 +1212,7 @@ async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
     if qb_client := get_qbit_client():
         try:
             cmd_txt = update.message.text.strip().split(" ", maxsplit=1)
-            if len(cmd_txt) > 1:
-                if re.search("^-M", cmd_txt[1], re.IGNORECASE):
-                    upload_mode = "ME" if unzip else "M"
-                elif re.search("^-G", cmd_txt[1], re.IGNORECASE):
-                    upload_mode = "ELG" if unzip and leech else "E" if unzip else "LG" if leech else "A"
-                elif unzip:
-                    upload_mode = "E"
-                elif leech:
-                    upload_mode = "L"
-                else:
-                    upload_mode = "A"
-            elif unzip:
-                upload_mode = "E"
-            elif leech:
-                upload_mode = "L"
-            else:
-                upload_mode = "A"
+            upload_mode = await get_upload_mode(cmd_txt, unzip, leech)
             if reply_msg := update.message.reply_to_message:
                 if reply_doc := reply_msg.document:
                     if file_path := await is_torrent_file(reply_doc, context):
@@ -1325,12 +1325,6 @@ async def trigger_extract_upload(torrent: Union[aria2p.Download, qbittorrentapi.
 
 async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
     total_downloads: List[Union[aria2p.Download, qbittorrentapi.TorrentDictionary]] = []
-    ngrok_url = None
-    try:
-        if tunnel := ngrok.get_tunnels():
-            ngrok_url = f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/ngrok_url"
-    except ngrok.PyngrokError:
-        pass
     if qb_client := get_qbit_client():
         try:
             total_downloads.extend([torrent for torrent in qb_client.torrents_info(status_filter="all")])
@@ -1344,8 +1338,7 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 msg = f"✅ <b>Downloaded: </b><code>{torrent.get('name')}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(torrent.get('size'))}</code>\n" \
                                       f"⏳ <b>Time taken: </b><code>{humanize.naturaldelta(torrent.get('completion_on') - torrent.get('added_on'))}</code>"
                                 file_name = torrent.files[0].get('name').split("/")[0] if torrent.files else torrent.get('name')
-                                if ngrok_url is not None:
-                                    msg += ngrok_url.replace("ngrok_url", quote(file_name))
+                                msg += get_ngrok_file_url(file_name)
                                 send_status_update(msg)
                                 QBIT_STATUS_DICT[torrent.get('hash')] = "SENT"
                                 asyncio.run_coroutine_threadsafe(coro=trigger_extract_upload(torrent, torrent.get('hash')), loop=asyncio.get_running_loop())
@@ -1361,9 +1354,7 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
                     if down.is_complete:
                         if not down.is_metadata and not down.followed_by_ids:
                             if down.gid in QBIT_STATUS_DICT and QBIT_STATUS_DICT[down.gid] == "NOT_SENT":
-                                msg = f"✅ <b>Downloaded: </b><code>{down.name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(down.total_length)}</code>"
-                                if ngrok_url is not None:
-                                    msg += ngrok_url.replace("ngrok_url", quote(down.name))
+                                msg = f"✅ <b>Downloaded: </b><code>{down.name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(down.total_length)}</code>{get_ngrok_file_url(down.name)}"
                                 send_status_update(msg)
                                 QBIT_STATUS_DICT[down.gid] = "SENT"
                                 asyncio.run_coroutine_threadsafe(coro=trigger_extract_upload(down, down.gid), loop=asyncio.get_running_loop())
