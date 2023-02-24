@@ -52,6 +52,7 @@ logging.getLogger("pyngrok.process").setLevel(logging.ERROR)
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
 logging.getLogger("apscheduler.executors.default").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
+from direct_link_generator import direct_link_gen, is_mega_link, is_gdrive_link
 aria2c: Optional[aria2p.API] = None
 pyro_app: Optional[Client] = None
 CONFIG_FILE_URL = os.getenv("CONFIG_FILE_URL")
@@ -1180,6 +1181,15 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
             if bool(re.findall(MAGNET_REGEX, link)) is True:
                 aria_obj = aria2c.add_magnet(magnet_uri=link, options=ARIA_OPTS)
             elif bool(re.findall(URL_REGEX, link)) is True:
+                if not is_mega_link(link) and not is_gdrive_link(link) and not link.endswith('.torrent'):
+                    logger.info(f"Generating direct link for: {link}")
+                    try:
+                        link = await asyncio.to_thread(direct_link_gen, link)
+                    except Exception as err:
+                        if "No Direct link function" not in str(err):
+                            logger.error(f"Failed to generate direct link for: {link}, error: {str(err)}")
+                            await reply_message(f"⁉️<b>Failed to generate direct link</b>\n<b>Reason: </b><code>{str(err)}</code>", update, context)
+                            return
                 aria_obj = aria2c.add_uris(uris=[link], options=ARIA_OPTS)
             else:
                 logger.warning(f"Invalid link: {link}")

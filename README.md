@@ -34,6 +34,8 @@ GDRIVE_FOLDER_ID = 'abcXYZ'
 NGROK_AUTH_TOKEN = ""
 # For clearing tasks whose upload is completed
 AUTO_DEL_TASK = False
+# For downloading files from uptobox
+UPTOBOX_TOKEN = ""
 ```
 
 ### Build and run the docker image
@@ -57,3 +59,8 @@ docker run --rm -it -v $PWD:/mnt --net host --entrypoint python mybot:latest gen
 ```sh
 docker run --rm -it --entrypoint python mybot:latest session_generator.py
 ```
+
+### Credits
+- [python-telegram-bot](https://github.com/python-telegram-bot) | [pyrogran](https://github.com/pyrogram)
+- [anasty17](https://github.com/anasty17) | [juned](https://github.com/junedkh) for [mirror-leech-telegram-bot](https://github.com/anasty17/mirror-leech-telegram-bot)
+- All the creators who are behind the awesome [modules/libraries](https://github.com/sachin0raon/Mirror2Gdrive/blob/master/requirements.txt) used in making this project
