@@ -1043,7 +1043,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update, context
     )
 
-async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[Optional[str], Optional[Message]]:
+async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                      loop: asyncio.events.AbstractEventLoop) -> Tuple[Optional[str], Optional[Message]]:
     logger.info(f"Fetching file: {doc.file_name}")
     tg_msg: Optional[Message] = None
     tg_file_path: Optional[str] = None
@@ -1057,16 +1058,16 @@ async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAU
         down_prog = UpDownProgressUpdate(name=doc.file_name, up_start_time=time.time(), total=doc.file_size, user_id=str(update.message.chat_id),
                                          stat_msg_id=tg_msg.message_id if tg_msg else None, action="📥 <b>Downloading</b>")
         try:
-            asyncio.run_coroutine_threadsafe(down_prog.trigger_update(), asyncio.get_running_loop())
+            asyncio.run_coroutine_threadsafe(down_prog.trigger_update(), loop)
             if pyro_app is not None:
                 tg_file_path = await pyro_app.download_media(message=doc.file_id, file_name=f"/tmp/{doc.file_id}",
                                                              progress=down_prog.set_processed_bytes)
+            else:
+                logger.error("could not find pyrogram session")
         except errors.RPCError as err:
             logger.error(f"Failed to download {doc.file_name} [{err.ID}]")
         except (ValueError, TimeoutError):
             logger.error(f"Given file: {doc.file_name} does not exist in telegram server or may be timeout error while downloading")
-        except RuntimeError:
-            logger.error(f"Failed to get running loop for updating download status of: {doc.file_name}")
         else:
             if tg_file_path is not None and os.path.exists(tg_file_path):
                 logger.info(f"Downloaded file from TG: {doc.file_name}")
@@ -1113,6 +1114,50 @@ async def is_torrent_file(doc: Document, context: ContextTypes.DEFAULT_TYPE) -> 
     tg_file_path = await tg_file.download_to_drive(custom_path=f"/tmp/{tg_file.file_id}")
     return tg_file_path if magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent" else None
 
+async def edit_or_reply(msg: Message, text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if msg is not None:
+        await context.bot.edit_message_text(text=text, chat_id=msg.chat_id, message_id=msg.message_id, parse_mode=constants.ParseMode.HTML)
+    else:
+        await reply_message(text, update, context)
+
+async def reply_handler(reply_doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE, upload_mode: str,
+                        loop: asyncio.events.AbstractEventLoop) -> None:
+    tg_file_path, tg_msg = await get_tg_file(reply_doc, update, context, loop)
+    if tg_file_path is None:
+        await edit_or_reply(tg_msg, f"❗<b>Failed to download file, please check /{LOG_CMD} for more details</b>", update, context)
+    elif magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent":
+        logger.info(f"Adding file to download: {reply_doc.file_name}")
+        try:
+            aria_obj = aria2c.add_torrent(torrent_file_path=tg_file_path)
+            UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
+            LEECH_CHAT_DICT[aria_obj.gid] = update.message.chat_id
+            if aria_obj.has_failed is False:
+                _msg = f"📥 <b>Download started</b> ✔️\n<i>Send /{STATUS_CMD} to view</i>"
+            else:
+                _msg = f"⚠️ <b>Failed to start download</b>\nError :<code>{aria_obj.error_message}</code>"
+        except aria2p.ClientException as err:
+            _msg = f"❗ <b>Failed to start download</b>\nError :<code>{err.__class__.__name__}</code>"
+        await edit_or_reply(tg_msg, _msg, update, context)
+    else:
+        file_path = f"{DOWNLOAD_PATH}/{reply_doc.file_name}"
+        shutil.move(src=tg_file_path, dst=file_path)
+        if "L" in upload_mode:
+            in_group = True if "G" in upload_mode else False
+            up_args = {"upload": False, "leech": True, "in_group": in_group}
+        elif "M" in upload_mode:
+            up_args = {"upload": False, "leech": False}
+        else:
+            up_args = {"upload": True, "leech": False}
+        up_args["extract"] = True if "E" in upload_mode and magic.from_file(file_path, mime=True) in ArchiveMimetypes else False
+        up_args["file_path"] = file_path
+        up_args["task_id"] = reply_doc.file_id
+        up_args["chat_id"] = update.message.chat_id
+        LEECH_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
+        if not any([up_args['extract'], up_args['upload'], up_args['leech']]):
+            await edit_or_reply(tg_msg, f"<b>File: </b><code>{reply_doc.file_name}</code> <b>is saved, use ngrok url to access</b>{get_ngrok_file_url(reply_doc.file_name)}", update, context)
+        logger.info(f"calling extract_upload_tg_file() with {up_args}")
+        await extract_upload_tg_file(**up_args)
+
 async def get_upload_mode(cmd_txt: List[str], unzip: bool, leech: bool) -> str:
     if len(cmd_txt) > 1:
         if re.search("^-M", cmd_txt[1], re.IGNORECASE):
@@ -1145,46 +1190,13 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
         upload_mode = await get_upload_mode(cmd_txt, unzip, leech)
         if reply_msg := update.message.reply_to_message:
             if reply_doc := reply_msg.document:
-                tg_file_path, tg_msg = await get_tg_file(reply_doc, update, context)
-                if tg_file_path is None:
-                    _msg = "❗<b>Failed to download file, please check log for more details</b>"
-                    if tg_msg is not None:
-                        await context.bot.edit_message_text(text=_msg, chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML)
-                    else:
-                        await reply_message(_msg, update, context)
-                elif magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent":
-                    logger.info(f"Adding file to download: {reply_doc.file_name}")
-                    aria_obj = aria2c.add_torrent(torrent_file_path=tg_file_path)
+                try:
+                    _loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    logger.error(f"Failed to get running loop for processing of: {reply_doc.file_name}")
+                    await reply_message(f"⁉️<b>File: </b><code>{reply_doc.file_name}</code> <b>failed to initiate process, please retry</b>", update, context)
                 else:
-                    try:
-                        _loop = asyncio.get_running_loop()
-                    except RuntimeError:
-                        logger.error(f"Failed to call extract_upload_tg_file() for: {reply_doc.file_name}")
-                        if tg_msg is not None:
-                            await context.bot.edit_message_text(
-                                text=f"⁉️<b>File: </b><code>{reply_doc.file_name}</code> <b>was downloaded but failed to initiate further process, please retry</b>",
-                                chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML)
-                    else:
-                        file_path = f"{DOWNLOAD_PATH}/{reply_doc.file_name}"
-                        shutil.move(src=tg_file_path, dst=file_path)
-                        if "L" in upload_mode:
-                            in_group = True if "G" in upload_mode else False
-                            up_args = {"upload": False, "leech": True, "in_group": in_group}
-                        elif "M" in upload_mode:
-                            up_args = {"upload": False, "leech": False}
-                        else:
-                            up_args = {"upload": True, "leech": False}
-                        up_args["extract"] = True if "E" in upload_mode and magic.from_file(file_path, mime=True) in ArchiveMimetypes else False
-                        up_args["file_path"] = file_path
-                        up_args["task_id"] = reply_doc.file_id
-                        up_args["chat_id"] = update.message.chat_id
-                        LEECH_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
-                        if tg_msg is not None and not any([up_args['extract'], up_args['upload'], up_args['leech']]):
-                            await context.bot.edit_message_text(
-                                text=f"<b>File: </b><code>{reply_doc.file_name}</code> <b>is saved, use ngrok url to access</b>{get_ngrok_file_url(reply_doc.file_name)}",
-                                chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML)
-                        logger.info(f"calling extract_upload_tg_file() with {up_args}")
-                        asyncio.run_coroutine_threadsafe(extract_upload_tg_file(**up_args), _loop)
+                    asyncio.run_coroutine_threadsafe(reply_handler(reply_doc, update, context, upload_mode, _loop), _loop)
             elif reply_text := reply_msg.text:
                 link = reply_text
             else:
@@ -1420,7 +1432,7 @@ def start_bot() -> None:
             unzip_qbit = CommandHandler(UNZIP_QBIT_CMD, qbit_unzip_upload, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             leech_aria = CommandHandler(LEECH_ARIA_CMD, aria_mirror_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             leech_qbit = CommandHandler(LEECH_QBIT_CMD, qbit_mirror_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
-            unzip_leech_aria = CommandHandler(UNZIP_LEECH_CMD, aria_unzip_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False), block=False)
+            unzip_leech_aria = CommandHandler(UNZIP_LEECH_CMD, aria_unzip_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             callback_handler = CallbackQueryHandler(bot_callback_handler, pattern="^aria|qbit|sys")
             application.add_handlers([start_handler, aria_handler, callback_handler, status_handler, info_handler, log_handler,
                                       qbit_handler, ngrok_handler, unzip_aria, unzip_qbit, leech_aria, leech_qbit, unzip_leech_aria])
