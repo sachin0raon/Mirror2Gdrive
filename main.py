@@ -268,9 +268,9 @@ def create_folder(folder_name: str, creds) -> Optional[str]:
             logger.warning(f"Failed to set permission for: {folder_name}")
     return folder_id
 
-class UploadProgressUpdate:
+class UpDownProgressUpdate:
     def __init__(self, name: str = None, up_start_time: float = 0.0, current: int = 0, total: int = 0,
-                 user_id: str = None, stat_msg_id: int = 0, delay: int = 5):
+                 user_id: str = None, stat_msg_id: int = None, delay: int = 5, action: str = "📤 <b>Uploading</b>"):
         self.file_name = name
         self.up_start_time = up_start_time
         self.uploaded_bytes = current
@@ -278,6 +278,7 @@ class UploadProgressUpdate:
         self.user_id = user_id
         self.stat_msg_id = stat_msg_id
         self.delay = delay
+        self.action = action
 
     async def set_processed_bytes(self, current: int = 0, total: int = 0) -> None:
         self.uploaded_bytes = current
@@ -286,7 +287,7 @@ class UploadProgressUpdate:
         try:
             await pyro_app.edit_message_text(
                   chat_id=self.user_id, message_id=self.stat_msg_id,
-                  text=f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{self.file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(self.total_bytes)}</code>\n"
+                  text=f"{self.action}\n🗂️ <b>File: </b><code>{self.file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(self.total_bytes)}</code>\n"
                        f"💾 <b>Processed: </b><code>{humanize.naturalsize(self.uploaded_bytes)} [{round(number=self.uploaded_bytes * 100 / self.total_bytes, ndigits=1)}%]</code>\n"
                        f"⚡ <b>Speed: </b><code>{humanize.naturalsize(self.uploaded_bytes / (time.time() - self.up_start_time))}/s</code>")
         except errors.RPCError as err:
@@ -298,7 +299,7 @@ class UploadProgressUpdate:
             await self.send_status_update()
 
 def upload_file(file_path: str, folder_id: str, creds, task_data: str = None, from_dir: bool = False,
-                up_prog: UploadProgressUpdate = None) -> None:
+                up_prog: UpDownProgressUpdate = None) -> None:
     file_name = os.path.basename(file_path)
     file_metadata = {'name': file_name, 'parents': [folder_id]}
     logger.info(f"Starting upload: {file_name}")
@@ -313,13 +314,18 @@ def upload_file(file_path: str, folder_id: str, creds, task_data: str = None, fr
                 response = None
                 _current_bytes = 0
                 _last_bytes = 0
+                _size = os.stat(file_path).st_size
                 while response is None:
                     try:
                         _status, response = drive_file.next_chunk()
                         if _status:
                             _current_bytes = _status.resumable_progress if _last_bytes == 0 else _status.resumable_progress - _last_bytes
                             _last_bytes = _status.resumable_progress
-                        up_prog.uploaded_bytes += _current_bytes
+                            up_prog.uploaded_bytes += _current_bytes
+                        elif _current_bytes == 0:
+                            up_prog.uploaded_bytes += _size
+                        else:
+                            up_prog.uploaded_bytes += _size - _current_bytes
                     except HttpError as err:
                         if err.resp.get('content-type', '').startswith('application/json'):
                             message = eval(err.content).get('error').get('errors')[0].get('message')
@@ -398,7 +404,7 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
                     for path, _, files in os.walk(file_path):
                         for f in files:
                             _size += os.stat(os.path.join(path, f)).st_size
-                up_prog = UploadProgressUpdate(name=file_name, up_start_time=time.time(), total=_size, user_id=chat_id,
+                up_prog = UpDownProgressUpdate(name=file_name, up_start_time=time.time(), total=_size, user_id=chat_id,
                                                stat_msg_id=_msg_id)
                 try:
                     asyncio.run_coroutine_threadsafe(coro=up_prog.trigger_update(), loop=asyncio.get_running_loop())
@@ -457,7 +463,7 @@ async def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[t
         return
     stat_msg_id = None
     _file_size = 0
-    upload_progress = UploadProgressUpdate()
+    upload_progress = UpDownProgressUpdate()
     if user_id is not None:
         if media_list is None:
             _file_size = os.stat(file_path).st_size
@@ -468,7 +474,7 @@ async def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[t
                 _file_size += os.stat(media_file.media).st_size
             msg_txt += f"{humanize.naturalsize(_file_size)}</code>\n📚 <b>Total Files: </b><code>{len(media_list)}</code>"
         stat_msg_id = await send_msg_async(msg_txt, user_id)
-        upload_progress = UploadProgressUpdate(file_name, time.time(), 0, _file_size, user_id, stat_msg_id)
+        upload_progress = UpDownProgressUpdate(file_name, time.time(), 0, _file_size, user_id, stat_msg_id)
     user_id = "self" if user_id is None else user_id
     logger.info(f"Tg Upload started: {file_name} [Total items: {len(media_list)}]") if media_list else logger.info(f"Tg Upload started: {file_name}")
     try:
@@ -886,7 +892,7 @@ async def start_extraction(name: str, prog: str, file_id: str, update: Update, u
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
         os.makedirs(name=f"{DOWNLOAD_PATH}/{folder_name}", exist_ok=True)
         try:
-            patoolib.extract_archive(archive=f"{DOWNLOAD_PATH}/{name}", outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
+            await asyncio.to_thread(patoolib.extract_archive, archive=f"{DOWNLOAD_PATH}/{name}", outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
             msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️{get_ngrok_file_url(folder_name)}"
             send_status_update(msg)
             if upload is True:
@@ -1048,13 +1054,19 @@ async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAU
         tg_file_path = await tg_file.download_to_drive(custom_path=f"/tmp/{doc.file_id}")
     except error.TelegramError:
         logger.error(f"Failed to download {doc.file_name}, retrying with pyrogram")
+        down_prog = UpDownProgressUpdate(name=doc.file_name, up_start_time=time.time(), total=doc.file_size, user_id=str(update.message.chat_id),
+                                         stat_msg_id=tg_msg.message_id if tg_msg else None, action="📥 <b>Downloading</b>")
         try:
+            asyncio.run_coroutine_threadsafe(down_prog.trigger_update(), asyncio.get_running_loop())
             if pyro_app is not None:
-                tg_file_path = await pyro_app.download_media(message=doc.file_id, file_name=f"/tmp/{doc.file_id}")
+                tg_file_path = await pyro_app.download_media(message=doc.file_id, file_name=f"/tmp/{doc.file_id}",
+                                                             progress=down_prog.set_processed_bytes)
         except errors.RPCError as err:
             logger.error(f"Failed to download {doc.file_name} [{err.ID}]")
         except (ValueError, TimeoutError):
             logger.error(f"Given file: {doc.file_name} does not exist in telegram server or may be timeout error while downloading")
+        except RuntimeError:
+            logger.error(f"Failed to get running loop for updating download status of: {doc.file_name}")
         else:
             if tg_file_path is not None and os.path.exists(tg_file_path):
                 logger.info(f"Downloaded file from TG: {doc.file_name}")
@@ -1063,6 +1075,8 @@ async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAU
                         text=f"<b>File: </b><code>{doc.file_name}</code> <b>is downloaded, starting further process</b>",
                         chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML
                     )
+        finally:
+            down_prog.stat_msg_id = None
     return tg_file_path, tg_msg
 
 async def extract_upload_tg_file(file_path: str, upload: bool = False, leech: bool = False, task_id: str = "",
@@ -1074,7 +1088,7 @@ async def extract_upload_tg_file(file_path: str, upload: bool = False, leech: bo
     try:
         if extract:
             os.makedirs(name=f"{DOWNLOAD_PATH}/{folder_name}", exist_ok=True)
-            patoolib.extract_archive(archive=file_path, outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
+            await asyncio.to_thread(patoolib.extract_archive, archive=file_path, outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
             msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️"
             if not upload and not leech:
                 msg += get_ngrok_file_url(folder_name)
@@ -1289,7 +1303,7 @@ async def extract_and_upload(torrent: Union[aria2p.Download, qbittorrentapi.Torr
             folder_name = os.path.splitext(file_name)[0]
             os.makedirs(name=f"{DOWNLOAD_PATH}/{folder_name}", exist_ok=True)
             try:
-                patoolib.extract_archive(archive=f"{DOWNLOAD_PATH}/{file_name}", outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
+                await asyncio.to_thread(patoolib.extract_archive, archive=f"{DOWNLOAD_PATH}/{file_name}", outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
                 msg = f"🗂️ <b>File:</b> <code>{file_name}</code> <b>extracted</b> ✔️"
                 await send_msg_async(msg, chat_id)
             except patoolib.util.PatoolError as err:
