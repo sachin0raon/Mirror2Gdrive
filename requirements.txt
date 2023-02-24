@@ -18,3 +18,7 @@ ffmpeg-python==0.2.0
 ffprobe-python==1.0.3
 filesplit==4.0.1
 uvloop==0.17.0
+beautifulsoup4==4.11.2
+cfscrape==2.1.1
+lxml==4.9.2
+git+https://github.com/zevtyardt/lk21.git

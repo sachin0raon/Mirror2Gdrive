@@ -52,6 +52,7 @@ logging.getLogger("pyngrok.process").setLevel(logging.ERROR)
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
 logging.getLogger("apscheduler.executors.default").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
+from direct_link_generator import direct_link_gen, is_mega_link, is_gdrive_link
 aria2c: Optional[aria2p.API] = None
 pyro_app: Optional[Client] = None
 CONFIG_FILE_URL = os.getenv("CONFIG_FILE_URL")
@@ -122,6 +123,19 @@ def get_qbit_client() -> Optional[qbittorrentapi.Client]:
         logger.error(f"Failed to initialize client: {str(err)}")
         return None
 
+async def send_msg_async(msg: str, user_id: Union[str, int]) -> int:
+    msg_id: int = 0
+    if all([pyro_app, msg, user_id]):
+        try:
+            message = await pyro_app.send_message(chat_id=user_id, text=msg, parse_mode=enums.ParseMode.HTML,
+                                                  disable_notification=True, disable_web_page_preview=True)
+            msg_id = message.id
+        except errors.RPCError as err:
+            logger.error(f"Failed to send msg to {user_id}[{err.ID}]")
+    else:
+        logger.warning(f"Failed to send msg to {user_id}[req param missing]")
+    return msg_id
+
 def send_status_update(msg: str, userid: Optional[str] = None) -> Dict[str, str]:
     tg_api_url = "https://api.telegram.org/bot{}/sendMessage"
     headers = {
@@ -156,10 +170,10 @@ def send_status_update(msg: str, userid: Optional[str] = None) -> Dict[str, str]
             logger.warning("Failed to get sent message detail")
     return msg_chat_dict
 
-async def delete_msg(msg_id: str, chat_id: Union[str, int]) -> None:
-    if pyro_app is not None and msg_id is not None and chat_id is not None:
+async def delete_msg(msg_id: int, chat_id: Union[str, int]) -> None:
+    if all([pyro_app, msg_id, chat_id]):
         try:
-            await pyro_app.delete_messages(chat_id=chat_id, message_ids=int(msg_id))
+            await pyro_app.delete_messages(chat_id=chat_id, message_ids=msg_id)
         except errors.RPCError as err:
             logger.warning(f"Failed to delete msg: {msg_id}[{err.ID}]")
 
@@ -206,7 +220,7 @@ def delete_empty_folder(folder_id: str, creds = None) -> None:
             logger.warning(f"Failed to delete folder: {folder_id}")
 
 def remove_extracted_dir(file_name: str) -> None:
-    if is_archive_file(file_name) and os.path.exists(f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}"):
+    if os.path.exists(f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}"):
         shutil.rmtree(path=f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}", ignore_errors=True)
 
 def clear_task_files(task_id: str = None, is_qbit: bool = False) -> None:
@@ -254,9 +268,9 @@ def create_folder(folder_name: str, creds) -> Optional[str]:
             logger.warning(f"Failed to set permission for: {folder_name}")
     return folder_id
 
-class UploadProgressUpdate:
+class UpDownProgressUpdate:
     def __init__(self, name: str = None, up_start_time: float = 0.0, current: int = 0, total: int = 0,
-                 user_id: str = None, stat_msg_id: Union[str, int] = None, delay: int = 5):
+                 user_id: str = None, stat_msg_id: int = None, delay: int = 5, action: str = "📤 <b>Uploading</b>"):
         self.file_name = name
         self.up_start_time = up_start_time
         self.uploaded_bytes = current
@@ -264,18 +278,16 @@ class UploadProgressUpdate:
         self.user_id = user_id
         self.stat_msg_id = stat_msg_id
         self.delay = delay
+        self.action = action
 
     async def set_processed_bytes(self, current: int = 0, total: int = 0) -> None:
         self.uploaded_bytes = current
-
-    def sync_uploaded_bytes(self, _uploaded: int = 0):
-        self.uploaded_bytes = _uploaded
 
     async def send_status_update(self) -> None:
         try:
             await pyro_app.edit_message_text(
                   chat_id=self.user_id, message_id=self.stat_msg_id,
-                  text=f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{self.file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(self.total_bytes)}</code>\n"
+                  text=f"{self.action}\n🗂️ <b>File: </b><code>{self.file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(self.total_bytes)}</code>\n"
                        f"💾 <b>Processed: </b><code>{humanize.naturalsize(self.uploaded_bytes)} [{round(number=self.uploaded_bytes * 100 / self.total_bytes, ndigits=1)}%]</code>\n"
                        f"⚡ <b>Speed: </b><code>{humanize.naturalsize(self.uploaded_bytes / (time.time() - self.up_start_time))}/s</code>")
         except errors.RPCError as err:
@@ -287,7 +299,7 @@ class UploadProgressUpdate:
             await self.send_status_update()
 
 def upload_file(file_path: str, folder_id: str, creds, task_data: str = None, from_dir: bool = False,
-                up_prog: UploadProgressUpdate = None) -> None:
+                up_prog: UpDownProgressUpdate = None) -> None:
     file_name = os.path.basename(file_path)
     file_metadata = {'name': file_name, 'parents': [folder_id]}
     logger.info(f"Starting upload: {file_name}")
@@ -300,14 +312,20 @@ def upload_file(file_path: str, folder_id: str, creds, task_data: str = None, fr
                     media_body=MediaFileUpload(filename=file_path, resumable=True, chunksize=50 * 1024 * 1024),
                     fields='id')
                 response = None
-                up_prog.file_name = file_name
-                up_prog.uploaded_bytes = 0
-                up_prog.total_bytes = os.stat(file_path).st_size
-                up_prog.up_start_time = time.time()
+                _current_bytes = 0
+                _last_bytes = 0
+                _size = os.stat(file_path).st_size
                 while response is None:
                     try:
                         _status, response = drive_file.next_chunk()
-                        up_prog.sync_uploaded_bytes(_status.resumable_progress if _status else up_prog.total_bytes)
+                        if _status:
+                            _current_bytes = _status.resumable_progress if _last_bytes == 0 else _status.resumable_progress - _last_bytes
+                            _last_bytes = _status.resumable_progress
+                            up_prog.uploaded_bytes += _current_bytes
+                        elif _current_bytes == 0:
+                            up_prog.uploaded_bytes += _size
+                        else:
+                            up_prog.uploaded_bytes += _size - _current_bytes
                     except HttpError as err:
                         if err.resp.get('content-type', '').startswith('application/json'):
                             message = eval(err.content).get('error').get('errors')[0].get('message')
@@ -351,7 +369,7 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
     is_dir = False
     file_name = None
     task_done = False
-    msg_chat_dict: Dict[str, str] = dict()
+    _msg_id = 0
     task_id: Optional[str] = None
     try:
         aria2c.client.save_session()
@@ -378,15 +396,17 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
             return
         else:
             if creds := get_oauth_creds():
-                _chat_id = _msg_id = None
-                _size = os.stat(file_path).st_size
-                up_prog = UploadProgressUpdate()
-                msg_chat_dict = send_status_update(f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{file_name}</code>", chat_id)
-                for i in msg_chat_dict:
-                    _chat_id = msg_chat_dict[i]
-                    _msg_id = i
+                _msg_id = await send_msg_async(f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{file_name}</code>", chat_id)
+                _size = 0
+                if os.path.isfile(file_path):
+                    _size = os.stat(file_path).st_size
+                else:
+                    for path, _, files in os.walk(file_path):
+                        for f in files:
+                            _size += os.stat(os.path.join(path, f)).st_size
+                up_prog = UpDownProgressUpdate(name=file_name, up_start_time=time.time(), total=_size, user_id=chat_id,
+                                               stat_msg_id=_msg_id)
                 try:
-                    up_prog = UploadProgressUpdate(name=file_name, total=_size, user_id=_chat_id, stat_msg_id=_msg_id)
                     asyncio.run_coroutine_threadsafe(coro=up_prog.trigger_update(), loop=asyncio.get_running_loop())
                 except RuntimeError:
                     logger.warning("Failed to start upload status task")
@@ -414,8 +434,7 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
         else:
             delete_empty_folder(folder_id, creds)
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <i>Please check the log for more details using</i> <code>/{LOG_CMD}</code>")
-    for msg_id in msg_chat_dict:
-        await delete_msg(msg_id, msg_chat_dict[msg_id])
+    await delete_msg(_msg_id, chat_id)
     return task_done
 
 def get_duration(file_path: str) -> int:
@@ -444,7 +463,7 @@ async def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[t
         return
     stat_msg_id = None
     _file_size = 0
-    upload_progress = UploadProgressUpdate()
+    upload_progress = UpDownProgressUpdate()
     if user_id is not None:
         if media_list is None:
             _file_size = os.stat(file_path).st_size
@@ -454,13 +473,13 @@ async def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[t
             for media_file in media_list:
                 _file_size += os.stat(media_file.media).st_size
             msg_txt += f"{humanize.naturalsize(_file_size)}</code>\n📚 <b>Total Files: </b><code>{len(media_list)}</code>"
-        for msg_id in send_status_update(msg_txt, user_id):
-            stat_msg_id = msg_id
-        upload_progress = UploadProgressUpdate(file_name, time.time(), 0, _file_size, user_id, stat_msg_id)
+        stat_msg_id = await send_msg_async(msg_txt, user_id)
+        upload_progress = UpDownProgressUpdate(file_name, time.time(), 0, _file_size, user_id, stat_msg_id)
     user_id = "self" if user_id is None else user_id
     logger.info(f"Tg Upload started: {file_name} [Total items: {len(media_list)}]") if media_list else logger.info(f"Tg Upload started: {file_name}")
     try:
-        asyncio.run_coroutine_threadsafe(coro=upload_progress.trigger_update(), loop=asyncio.get_running_loop())
+        if media_list is None:
+            asyncio.run_coroutine_threadsafe(coro=upload_progress.trigger_update(), loop=asyncio.get_running_loop())
     except RuntimeError:
         logger.warning("Failed to start upload status task")
     try:
@@ -481,7 +500,6 @@ async def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[t
             await pyro_app.send_document(chat_id=user_id, document=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
                                          file_name=file_name, disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes)
         logger.info(f"Tg Upload completed: {file_name} [Total items: {len(media_list)}]") if media_list else logger.info(f"Tg Upload completed: {file_name}")
-        await delete_msg(msg_id=stat_msg_id, chat_id=user_id)
     except (ValueError, FileNotFoundError) as err:
         logger.error(f"Tg Upload failed: {file_name} [{str(err)}]")
     except errors.FloodWait as err:
@@ -492,6 +510,7 @@ async def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[t
         raise err
     finally:
         upload_progress.stat_msg_id = None
+        await delete_msg(msg_id=stat_msg_id, chat_id=user_id)
 
 async def get_file_thumb(file_path: str) -> Optional[str]:
     name, ext = os.path.splitext(os.path.basename(file_path))
@@ -553,7 +572,7 @@ async def split_file(file_path: str, file_size: int, is_video: bool = True, is_a
             _task_done = True
         except (ffmpeg.Error, FileNotFoundError, ValueError) as err:
             logger.error(f"Split error: {_name}{_ext}[{str(err)}]")
-            send_status_update(f"{err_msg}<b>Error: </b><code>{str(err)}</code>", user_id)
+            await send_msg_async(f"{err_msg}<b>Error: </b><code>{str(err)}</code>", user_id)
     else:
         logger.info(f"Starting to split: {_name}{_ext}")
         _split_files: List[str] = []
@@ -569,7 +588,7 @@ async def split_file(file_path: str, file_size: int, is_video: bool = True, is_a
             _task_done = True
         except Exception as err:
             logger.error(f"Split error: {_name}{_ext}[{str(err)}]")
-            send_status_update(f"{err_msg}<b>Error: </b><code>{str(err).replace('>', '').replace('>', '')}</code>", user_id)
+            await send_msg_async(f"{err_msg}<b>Error: </b><code>{str(err).replace('>', '').replace('>', '')}</code>", user_id)
     if not _task_done:
         shutil.rmtree(out_dir, ignore_errors=True)
         split_files_list.clear()
@@ -633,6 +652,7 @@ async def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False
             logger.info(f"Cleaning up: {file_name}")
             shutil.rmtree(path=down_path, ignore_errors=True)
             shutil.rmtree(path=f"{DOWNLOAD_PATH}/splits/{os.path.splitext(file_name)[0]}", ignore_errors=True)
+            clear_task_files(task_id)
 
 def get_user(update: Update) -> Union[str, int]:
     return update.message.from_user.name if update.message.from_user.name is not None else update.message.chat_id
@@ -674,9 +694,18 @@ def get_ngrok_btn(file_name: str) -> Optional[InlineKeyboardButton]:
     try:
         if tunnels := ngrok.get_tunnels():
             return InlineKeyboardButton(text="🌐 Ngrok URL", url=f"{tunnels[0].public_url}/{quote(file_name)}")
-    except (IndexError, ngrok.PyngrokError) as err:
-        logger.error(f"Failed to get ngrok tunnel, error: {str(err)}")
+    except (IndexError, ngrok.PyngrokError):
+        logger.error(f"Failed to get ngrok tunnel")
         return None
+
+def get_ngrok_file_url(file_name: str) -> str:
+    _url = ''
+    try:
+        if tunnels := ngrok.get_tunnels():
+            _url += f"\n🌎 <b>URL: </b>{tunnels[0].public_url}/{quote(file_name)}"
+    except ngrok.PyngrokError:
+        logger.debug(f"Failed to get ngrok url for: {file_name}")
+    return _url
 
 def get_buttons(prog: str, dl_info: str) -> Dict[str, InlineKeyboardButton]:
     return {
@@ -854,9 +883,7 @@ def is_file_extracted(file_name: str) -> bool:
 async def start_extraction(name: str, prog: str, file_id: str, update: Update, upload: bool = False) -> None:
     folder_name = os.path.splitext(name)[0]
     if is_file_extracted(name):
-        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already extracted</b>"
-        if tunnel := ngrok.get_tunnels():
-            msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(folder_name)}"
+        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already extracted</b>{get_ngrok_file_url(folder_name)}"
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
     else:
         msg = f"🗃️ <b>Extraction started for: </b><code>{name}</code>\n⚠️ <i>Do not press the extract button again unless it has failed, you'll receive status updates on the same.</i>"
@@ -865,10 +892,8 @@ async def start_extraction(name: str, prog: str, file_id: str, update: Update, u
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
         os.makedirs(name=f"{DOWNLOAD_PATH}/{folder_name}", exist_ok=True)
         try:
-            patoolib.extract_archive(archive=f"{DOWNLOAD_PATH}/{name}", outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
-            msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️"
-            if tunnel := ngrok.get_tunnels():
-                msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(folder_name)}"
+            await asyncio.to_thread(patoolib.extract_archive, archive=f"{DOWNLOAD_PATH}/{name}", outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
+            msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️{get_ngrok_file_url(folder_name)}"
             send_status_update(msg)
             if upload is True:
                 try:
@@ -982,9 +1007,8 @@ async def ngrok_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await reply_message(f"🌐 <b>Ngrok URL:</b> {tunnels[0].public_url}", update, context)
         else:
             raise IndexError("No tunnel found")
-    except (IndexError, ngrok.PyngrokNgrokURLError, ngrok.PyngrokNgrokHTTPError) as err:
-        logger.error(f"Failed to get ngrok tunnel, error: {str(err)}")
-        logger.info("Restarting ngrok tunnel")
+    except (IndexError, ngrok.PyngrokNgrokURLError, ngrok.PyngrokNgrokHTTPError):
+        logger.error(f"Failed to get ngrok tunnel, restarting")
         try:
             if ngrok.process.is_process_running(conf.get_default().ngrok_path) is True:
                 ngrok.kill()
@@ -1019,7 +1043,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update, context
     )
 
-async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[Optional[str], Optional[Message]]:
+async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                      loop: asyncio.events.AbstractEventLoop) -> Tuple[Optional[str], Optional[Message]]:
     logger.info(f"Fetching file: {doc.file_name}")
     tg_msg: Optional[Message] = None
     tg_file_path: Optional[str] = None
@@ -1030,36 +1055,45 @@ async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAU
         tg_file_path = await tg_file.download_to_drive(custom_path=f"/tmp/{doc.file_id}")
     except error.TelegramError:
         logger.error(f"Failed to download {doc.file_name}, retrying with pyrogram")
+        down_prog = UpDownProgressUpdate(name=doc.file_name, up_start_time=time.time(), total=doc.file_size, user_id=str(update.message.chat_id),
+                                         stat_msg_id=tg_msg.message_id if tg_msg else None, action="📥 <b>Downloading</b>")
         try:
+            asyncio.run_coroutine_threadsafe(down_prog.trigger_update(), loop)
             if pyro_app is not None:
-                tg_file_path = await pyro_app.download_media(message=doc.file_id, file_name=f"/tmp/{doc.file_id}")
+                tg_file_path = await pyro_app.download_media(message=doc.file_id, file_name=f"/tmp/{doc.file_id}",
+                                                             progress=down_prog.set_processed_bytes)
+            else:
+                logger.error("could not find pyrogram session")
         except errors.RPCError as err:
             logger.error(f"Failed to download {doc.file_name} [{err.ID}]")
         except (ValueError, TimeoutError):
             logger.error(f"Given file: {doc.file_name} does not exist in telegram server or may be timeout error while downloading")
         else:
             if tg_file_path is not None and os.path.exists(tg_file_path):
+                logger.info(f"Downloaded file from TG: {doc.file_name}")
                 if tg_msg is not None:
                     tg_msg = await context.bot.edit_message_text(
                         text=f"<b>File: </b><code>{doc.file_name}</code> <b>is downloaded, starting further process</b>",
                         chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML
                     )
+        finally:
+            down_prog.stat_msg_id = None
     return tg_file_path, tg_msg
 
 async def extract_upload_tg_file(file_path: str, upload: bool = False, leech: bool = False, task_id: str = "",
-                                 in_group: bool = False, chat_id: str = None) -> None:
+                                 in_group: bool = False, chat_id: str = None, extract: bool = True) -> None:
     if os.path.exists(file_path) is False or os.path.isdir(file_path) is True:
         return
     name = os.path.basename(file_path)
-    folder_name = os.path.splitext(name)[0]
-    os.makedirs(name=f"{DOWNLOAD_PATH}/{folder_name}", exist_ok=True)
+    folder_name = os.path.splitext(name)[0] if extract else name
     try:
-        patoolib.extract_archive(archive=file_path, outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
-        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️"
-        if not upload and not leech:
-            if tunnel := ngrok.get_tunnels():
-                msg += f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/{quote(folder_name)}"
-        send_status_update(msg, chat_id)
+        if extract:
+            os.makedirs(name=f"{DOWNLOAD_PATH}/{folder_name}", exist_ok=True)
+            await asyncio.to_thread(patoolib.extract_archive, archive=file_path, outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
+            msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️"
+            if not upload and not leech:
+                msg += get_ngrok_file_url(folder_name)
+            await send_msg_async(msg, chat_id)
         if upload is True and await upload_to_gdrive(name=folder_name, chat_id=chat_id) is True:
             logger.info(f"Cleaning up: {name}")
             shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
@@ -1068,14 +1102,81 @@ async def extract_upload_tg_file(file_path: str, upload: bool = False, leech: bo
             await trigger_tg_upload(f"{DOWNLOAD_PATH}/{folder_name}", task_id, in_group)
     except patoolib.util.PatoolError as err:
         shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
-        send_status_update(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n"
-                           f"<i>Check /{LOG_CMD} for more details.</i>", chat_id)
+        await send_msg_async(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n"
+                             f"<i>Check /{LOG_CMD} for more details.</i>", chat_id)
+    finally:
+        if AUTO_DEL_TASK is True:
+            shutil.rmtree(file_path, ignore_errors=True)
 
 async def is_torrent_file(doc: Document, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
     logger.info(f"Fetching file: {doc.file_name}")
     tg_file = await context.bot.get_file(file_id=doc.file_id)
     tg_file_path = await tg_file.download_to_drive(custom_path=f"/tmp/{tg_file.file_id}")
     return tg_file_path if magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent" else None
+
+async def edit_or_reply(msg: Message, text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if msg is not None:
+        await context.bot.edit_message_text(text=text, chat_id=msg.chat_id, message_id=msg.message_id, parse_mode=constants.ParseMode.HTML)
+    else:
+        await reply_message(text, update, context)
+
+async def reply_handler(reply_doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE, upload_mode: str,
+                        loop: asyncio.events.AbstractEventLoop) -> None:
+    tg_file_path, tg_msg = await get_tg_file(reply_doc, update, context, loop)
+    if tg_file_path is None:
+        await edit_or_reply(tg_msg, f"❗<b>Failed to download file, please check /{LOG_CMD} for more details</b>", update, context)
+    elif magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent":
+        logger.info(f"Adding file to download: {reply_doc.file_name}")
+        try:
+            aria_obj = aria2c.add_torrent(torrent_file_path=tg_file_path)
+            UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
+            LEECH_CHAT_DICT[aria_obj.gid] = update.message.chat_id
+            if aria_obj.has_failed is False:
+                _msg = f"📥 <b>Download started</b> ✔️\n<i>Send /{STATUS_CMD} to view</i>"
+            else:
+                _msg = f"⚠️ <b>Failed to start download</b>\nError :<code>{aria_obj.error_message}</code>"
+        except aria2p.ClientException as err:
+            _msg = f"❗ <b>Failed to start download</b>\nError :<code>{err.__class__.__name__}</code>"
+        await edit_or_reply(tg_msg, _msg, update, context)
+    else:
+        file_path = f"{DOWNLOAD_PATH}/{reply_doc.file_name}"
+        shutil.move(src=tg_file_path, dst=file_path)
+        if "L" in upload_mode:
+            in_group = True if "G" in upload_mode else False
+            up_args = {"upload": False, "leech": True, "in_group": in_group}
+        elif "M" in upload_mode:
+            up_args = {"upload": False, "leech": False}
+        else:
+            up_args = {"upload": True, "leech": False}
+        up_args["extract"] = True if "E" in upload_mode and magic.from_file(file_path, mime=True) in ArchiveMimetypes else False
+        up_args["file_path"] = file_path
+        up_args["task_id"] = reply_doc.file_id
+        up_args["chat_id"] = update.message.chat_id
+        LEECH_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
+        if not any([up_args['extract'], up_args['upload'], up_args['leech']]):
+            await edit_or_reply(tg_msg, f"<b>File: </b><code>{reply_doc.file_name}</code> <b>is saved, use ngrok url to access</b>{get_ngrok_file_url(reply_doc.file_name)}", update, context)
+        logger.info(f"calling extract_upload_tg_file() with {up_args}")
+        await extract_upload_tg_file(**up_args)
+
+async def get_upload_mode(cmd_txt: List[str], unzip: bool, leech: bool) -> str:
+    if len(cmd_txt) > 1:
+        if re.search("^-M", cmd_txt[1], re.IGNORECASE):
+            upload_mode = "ME" if unzip else "M"
+        elif re.search("^-G", cmd_txt[1], re.IGNORECASE):
+            upload_mode = "ELG" if unzip and leech else "E" if unzip else "LG" if leech else "A"
+        elif unzip:
+            upload_mode = "EL" if leech else "E"
+        elif leech:
+            upload_mode = "L"
+        else:
+            upload_mode = "A"
+    elif unzip:
+        upload_mode = "EL" if leech else "E"
+    elif leech:
+        upload_mode = "L"
+    else:
+        upload_mode = "A"
+    return upload_mode
 
 async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip: bool = False, leech: bool = False) -> None:
     logger.info(f"/{MIRROR_CMD if not unzip else UNZIP_ARIA_CMD} sent by {get_user(update)}")
@@ -1086,62 +1187,16 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
                f"<i>Send /{LEECH_ARIA_CMD} -g or /{UNZIP_LEECH_CMD} -g to leech files as a media group</i>"
     try:
         cmd_txt = update.message.text.strip().split(" ", maxsplit=1)
-        if len(cmd_txt) > 1:
-            if re.search("^-M", cmd_txt[1], re.IGNORECASE):
-                upload_mode = "ME" if unzip else "M"
-            elif re.search("^-G", cmd_txt[1], re.IGNORECASE):
-                upload_mode = "ELG" if unzip and leech else "E" if unzip else "LG" if leech else "A"
-            elif unzip:
-                upload_mode = "EL" if leech else "E"
-            elif leech:
-                upload_mode = "L"
-            else:
-                upload_mode = "A"
-        elif unzip:
-            upload_mode = "EL" if leech else "E"
-        elif leech:
-            upload_mode = "L"
-        else:
-            upload_mode = "A"
+        upload_mode = await get_upload_mode(cmd_txt, unzip, leech)
         if reply_msg := update.message.reply_to_message:
             if reply_doc := reply_msg.document:
-                tg_file_path, tg_msg = await get_tg_file(reply_doc, update, context)
-                if tg_file_path is None:
-                    _msg = "❗<b>Failed to download file, please check log for more details</b>"
-                    if tg_msg is not None:
-                        await context.bot.edit_message_text(text=_msg, chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML)
-                    else:
-                        await reply_message(_msg, update, context)
-                elif magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent":
-                    logger.info(f"Adding file to download: {reply_doc.file_name}")
-                    aria_obj = aria2c.add_torrent(torrent_file_path=tg_file_path)
-                elif magic.from_file(tg_file_path, mime=True) in ArchiveMimetypes:
-                    file_path = f"{DOWNLOAD_PATH}/{reply_doc.file_name}"
-                    if tg_msg is not None:
-                        await context.bot.edit_message_text(text=f"<b>File: </b><code>{reply_doc.file_name}</code> <b>extraction started</b>",
-                                                            chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML)
-                    shutil.move(src=tg_file_path, dst=file_path)
-                    if "L" in upload_mode:
-                        in_group = True if "G" in upload_mode else False
-                        up_args = {"upload": False, "leech": True, "in_group": in_group}
-                    elif "M" in upload_mode:
-                        up_args = {"upload": False, "leech": False}
-                    else:
-                        up_args = {"upload": True, "leech": False}
-                    up_args["file_path"] = file_path
-                    up_args["task_id"] = reply_doc.file_id
-                    up_args["chat_id"] = update.message.chat_id
-                    LEECH_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
-                    try:
-                        asyncio.run_coroutine_threadsafe(extract_upload_tg_file(**up_args), asyncio.get_running_loop())
-                    except RuntimeError:
-                        logger.error(f"Failed to call extract_upload_tg_file() for: {reply_doc.file_name}")
-                        if tg_msg is not None:
-                            await context.bot.edit_message_text(
-                                text=f"⁉️<b>File: </b><code>{reply_doc.file_name}</code> <b>unable to initiate file extraction, please retry</b>",
-                                chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML)
+                try:
+                    _loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    logger.error(f"Failed to get running loop for processing of: {reply_doc.file_name}")
+                    await reply_message(f"⁉️<b>File: </b><code>{reply_doc.file_name}</code> <b>failed to initiate process, please retry</b>", update, context)
                 else:
-                    await reply_message(f"❗<b>Given file type not supported, please send a torrent/archive file.</b>", update, context)
+                    asyncio.run_coroutine_threadsafe(reply_handler(reply_doc, update, context, upload_mode, _loop), _loop)
             elif reply_text := reply_msg.text:
                 link = reply_text
             else:
@@ -1152,6 +1207,15 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
             if bool(re.findall(MAGNET_REGEX, link)) is True:
                 aria_obj = aria2c.add_magnet(magnet_uri=link, options=ARIA_OPTS)
             elif bool(re.findall(URL_REGEX, link)) is True:
+                if not is_mega_link(link) and not is_gdrive_link(link) and not link.endswith('.torrent'):
+                    logger.info(f"Generating direct link for: {link}")
+                    try:
+                        link = await asyncio.to_thread(direct_link_gen, link)
+                    except Exception as err:
+                        if "No Direct link function" not in str(err):
+                            logger.error(f"Failed to generate direct link for: {link}, error: {str(err)}")
+                            await reply_message(f"⁉️<b>Failed to generate direct link</b>\n<b>Reason: </b><code>{str(err)}</code>", update, context)
+                            return
                 aria_obj = aria2c.add_uris(uris=[link], options=ARIA_OPTS)
             else:
                 logger.warning(f"Invalid link: {link}")
@@ -1171,7 +1235,7 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
         await reply_message(help_txt, update, context)
     except aria2p.ClientException:
         await reply_message("❗ <b>Failed to start download, kindly check the link and retry.</b>", update, context)
-    except error.TelegramError:
+    except (error.TelegramError, FileNotFoundError):
         await reply_message("❗<b>Failed to process the given file</b>", update, context)
 
 async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip: bool = False, leech: bool = False) -> None:
@@ -1184,23 +1248,7 @@ async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
     if qb_client := get_qbit_client():
         try:
             cmd_txt = update.message.text.strip().split(" ", maxsplit=1)
-            if len(cmd_txt) > 1:
-                if re.search("^-M", cmd_txt[1], re.IGNORECASE):
-                    upload_mode = "ME" if unzip else "M"
-                elif re.search("^-G", cmd_txt[1], re.IGNORECASE):
-                    upload_mode = "ELG" if unzip and leech else "E" if unzip else "LG" if leech else "A"
-                elif unzip:
-                    upload_mode = "E"
-                elif leech:
-                    upload_mode = "L"
-                else:
-                    upload_mode = "A"
-            elif unzip:
-                upload_mode = "E"
-            elif leech:
-                upload_mode = "L"
-            else:
-                upload_mode = "A"
+            upload_mode = await get_upload_mode(cmd_txt, unzip, leech)
             if reply_msg := update.message.reply_to_message:
                 if reply_doc := reply_msg.document:
                     if file_path := await is_torrent_file(reply_doc, context):
@@ -1262,18 +1310,18 @@ async def extract_and_upload(torrent: Union[aria2p.Download, qbittorrentapi.Torr
     if is_archive_file(file_name):
         if is_file_extracted(file_name):
             msg = f"🗂️ <b>File:</b> <code>{file_name}</code> is already <b>extracted</b> ✔️"
-            send_status_update(msg, chat_id)
+            await send_msg_async(msg, chat_id)
         else:
             folder_name = os.path.splitext(file_name)[0]
             os.makedirs(name=f"{DOWNLOAD_PATH}/{folder_name}", exist_ok=True)
             try:
-                patoolib.extract_archive(archive=f"{DOWNLOAD_PATH}/{file_name}", outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
+                await asyncio.to_thread(patoolib.extract_archive, archive=f"{DOWNLOAD_PATH}/{file_name}", outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
                 msg = f"🗂️ <b>File:</b> <code>{file_name}</code> <b>extracted</b> ✔️"
-                send_status_update(msg, chat_id)
+                await send_msg_async(msg, chat_id)
             except patoolib.util.PatoolError as err:
                 shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
-                send_status_update(f"⁉️<b>Failed to extract:</b> <code>{file_name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n"
-                                   f"<i>Check /{LOG_CMD} for more details.</i>", chat_id)
+                await send_msg_async(f"⁉️<b>Failed to extract:</b> <code>{file_name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n"
+                                     f"<i>Check /{LOG_CMD} for more details.</i>", chat_id)
             else:
                 if upload and await upload_to_gdrive(name=folder_name, chat_id=chat_id):
                     if AUTO_DEL_TASK is True:
@@ -1309,16 +1357,10 @@ async def trigger_extract_upload(torrent: Union[aria2p.Download, qbittorrentapi.
             else:
                 logger.info(f"Nothing needs to be done for: {task_id}")
         except RuntimeError:
-            logger.error("Failed to start thetrigger")
+            logger.error("Failed to run trigger_extract_upload()")
 
 async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
     total_downloads: List[Union[aria2p.Download, qbittorrentapi.TorrentDictionary]] = []
-    ngrok_url = None
-    try:
-        if tunnel := ngrok.get_tunnels():
-            ngrok_url = f"\n🌎 <b>URL:</b> {tunnel[0].public_url}/ngrok_url"
-    except ngrok.PyngrokError:
-        pass
     if qb_client := get_qbit_client():
         try:
             total_downloads.extend([torrent for torrent in qb_client.torrents_info(status_filter="all")])
@@ -1332,8 +1374,7 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 msg = f"✅ <b>Downloaded: </b><code>{torrent.get('name')}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(torrent.get('size'))}</code>\n" \
                                       f"⏳ <b>Time taken: </b><code>{humanize.naturaldelta(torrent.get('completion_on') - torrent.get('added_on'))}</code>"
                                 file_name = torrent.files[0].get('name').split("/")[0] if torrent.files else torrent.get('name')
-                                if ngrok_url is not None:
-                                    msg += ngrok_url.replace("ngrok_url", quote(file_name))
+                                msg += get_ngrok_file_url(file_name)
                                 send_status_update(msg)
                                 QBIT_STATUS_DICT[torrent.get('hash')] = "SENT"
                                 asyncio.run_coroutine_threadsafe(coro=trigger_extract_upload(torrent, torrent.get('hash')), loop=asyncio.get_running_loop())
@@ -1349,9 +1390,7 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
                     if down.is_complete:
                         if not down.is_metadata and not down.followed_by_ids:
                             if down.gid in QBIT_STATUS_DICT and QBIT_STATUS_DICT[down.gid] == "NOT_SENT":
-                                msg = f"✅ <b>Downloaded: </b><code>{down.name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(down.total_length)}</code>"
-                                if ngrok_url is not None:
-                                    msg += ngrok_url.replace("ngrok_url", quote(down.name))
+                                msg = f"✅ <b>Downloaded: </b><code>{down.name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(down.total_length)}</code>{get_ngrok_file_url(down.name)}"
                                 send_status_update(msg)
                                 QBIT_STATUS_DICT[down.gid] = "SENT"
                                 asyncio.run_coroutine_threadsafe(coro=trigger_extract_upload(down, down.gid), loop=asyncio.get_running_loop())
@@ -1393,7 +1432,7 @@ def start_bot() -> None:
             unzip_qbit = CommandHandler(UNZIP_QBIT_CMD, qbit_unzip_upload, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             leech_aria = CommandHandler(LEECH_ARIA_CMD, aria_mirror_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             leech_qbit = CommandHandler(LEECH_QBIT_CMD, qbit_mirror_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
-            unzip_leech_aria = CommandHandler(UNZIP_LEECH_CMD, aria_unzip_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False), block=False)
+            unzip_leech_aria = CommandHandler(UNZIP_LEECH_CMD, aria_unzip_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             callback_handler = CallbackQueryHandler(bot_callback_handler, pattern="^aria|qbit|sys")
             application.add_handlers([start_handler, aria_handler, callback_handler, status_handler, info_handler, log_handler,
                                       qbit_handler, ngrok_handler, unzip_aria, unzip_qbit, leech_aria, leech_qbit, unzip_leech_aria])
