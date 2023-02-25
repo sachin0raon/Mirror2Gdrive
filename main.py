@@ -28,17 +28,17 @@ from patoolib import ArchiveMimetypes
 from qbit_conf import QBIT_CONF
 from pyngrok import ngrok, conf
 from urllib.parse import quote
-from io import StringIO
+from io import StringIO, FileIO
 from typing import Union, Optional, Dict, List, Tuple
 from dotenv import load_dotenv
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError, Retrying
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError, Retrying, AsyncRetrying
 from telegram import Update, error, constants, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Document, Message
 from telegram.ext.filters import Chat
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, Application
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 from pyrogram import Client, errors, enums, types
 
@@ -52,7 +52,7 @@ logging.getLogger("pyngrok.process").setLevel(logging.ERROR)
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
 logging.getLogger("apscheduler.executors.default").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
-from direct_link_generator import direct_link_gen, is_mega_link, is_gdrive_link
+from direct_link_generator import direct_link_gen, is_mega_link, is_gdrive_link, get_gdrive_id
 aria2c: Optional[aria2p.API] = None
 pyro_app: Optional[Client] = None
 CONFIG_FILE_URL = os.getenv("CONFIG_FILE_URL")
@@ -205,8 +205,8 @@ def count_uploaded_files(creds = None, folder_id: str = None, file_name: str = N
             spaces='drive', fields='files(id, name, size)').execute()["files"]
         gdrive_service.close()
         count = len(files_list)
-    except Exception:
-        logger.error(f"Failed to get details of {folder_id}")
+    except Exception as err:
+        logger.error(f"Failed to get details of {folder_id}[{err.__class__.__name__}]")
     return count
 
 def delete_empty_folder(folder_id: str, creds = None) -> None:
@@ -270,7 +270,7 @@ def create_folder(folder_name: str, creds) -> Optional[str]:
 
 class UpDownProgressUpdate:
     def __init__(self, name: str = None, up_start_time: float = 0.0, current: int = 0, total: int = 0,
-                 user_id: str = None, stat_msg_id: int = None, delay: int = 5, action: str = "📤 <b>Uploading</b>"):
+                 user_id: str = None, stat_msg_id: Optional[int] = None, delay: int = 5, action: str = "📤 <b>Uploading</b>"):
         self.file_name = name
         self.up_start_time = up_start_time
         self.uploaded_bytes = current
@@ -284,6 +284,8 @@ class UpDownProgressUpdate:
         self.uploaded_bytes = current
 
     async def send_status_update(self) -> None:
+        if self.uploaded_bytes > self.total_bytes:
+            self.uploaded_bytes = self.total_bytes
         try:
             await pyro_app.edit_message_text(
                   chat_id=self.user_id, message_id=self.stat_msg_id,
@@ -291,7 +293,7 @@ class UpDownProgressUpdate:
                        f"💾 <b>Processed: </b><code>{humanize.naturalsize(self.uploaded_bytes)} [{round(number=self.uploaded_bytes * 100 / self.total_bytes, ndigits=1)}%]</code>\n"
                        f"⚡ <b>Speed: </b><code>{humanize.naturalsize(self.uploaded_bytes / (time.time() - self.up_start_time))}/s</code>")
         except errors.RPCError as err:
-            logger.warning(f"Failed to update upload status [{err.ID}]")
+            logger.warning(f"Failed to update status for {self.file_name} [{err.ID}]")
 
     async def trigger_update(self) -> None:
         while self.uploaded_bytes < self.total_bytes and self.stat_msg_id is not None:
@@ -392,7 +394,7 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
             file_name = name
         file_path = f"{DOWNLOAD_PATH}/{file_name}"
         if not os.path.exists(file_path):
-            logger.error("Upload event failed, could not find file_name")
+            logger.error(f"Upload event failed, could not find {file_path}")
             return
         else:
             if creds := get_oauth_creds():
@@ -440,17 +442,18 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
 def get_duration(file_path: str) -> int:
     duration = 0
     try:
-        for stream in FFProbe(file_path).streams:
-            if stream.is_video() or stream.is_audio():
-                duration = round(stream.duration_seconds())
-                break
-    except (FFProbeError, AttributeError):
+        probe = ffmpeg.probe(file_path)
+        _stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video' or stream['codec_type'] == 'audio'), None)
+        duration = round(float(_stream.get('duration', 0)))
+    except (ffmpeg.Error, ValueError) as err:
+        logger.warning(f"ffmpeg probe error: {err.__class__.__name__}")
         try:
-            probe = ffmpeg.probe(file_path)
-            _stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video' or stream['codec_type'] == 'audio'), None)
-            duration = round(float(_stream.get('duration', 0)))
-        except (ffmpeg.Error, ValueError) as err:
-            logger.warning(f"probe error: {str(err)}")
+            for stream in FFProbe(file_path).streams:
+                if stream.is_video() or stream.is_audio():
+                    duration = round(stream.duration_seconds())
+                    break
+        except (FFProbeError, AttributeError):
+            logger.warning(f"ffmpeg probe error: {err.__class__.__name__}")
     return duration
 
 @retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=(retry_if_exception_type(errors.RPCError)))
@@ -1120,6 +1123,162 @@ async def edit_or_reply(msg: Message, text: str, update: Update, context: Contex
     else:
         await reply_message(text, update, context)
 
+def download_gdrive_file(file_id: str, file_path: str, gdrive_service, down_prog: UpDownProgressUpdate, chat_id: str) -> None:
+    fh = FileIO(file=file_path, mode='wb')
+    try:
+        for attempt in Retrying(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=retry_if_exception_type(Exception)):
+            with attempt:
+                request = gdrive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
+                downloader = MediaIoBaseDownload(fh, request, chunksize=50 * 1024 * 1024)
+                done = False
+                _current_bytes = 0
+                _last_bytes = 0
+                while not done:
+                    _status, done = downloader.next_chunk()
+                    if _status:
+                        _current_bytes = _status.resumable_progress if _last_bytes == 0 else _status.resumable_progress - _last_bytes
+                        _last_bytes = _status.resumable_progress
+                        down_prog.uploaded_bytes += _current_bytes
+                    elif _current_bytes == 0:
+                        down_prog.uploaded_bytes += _status.total_size
+                    else:
+                        down_prog.uploaded_bytes += _status.total_size - _current_bytes
+                fh.close()
+    except RetryError as err:
+        fh.close()
+        last_err = err.last_attempt.exception()
+        err_msg = last_err.error_details if isinstance(last_err, HttpError) else str(last_err).replace('>', '').replace('>', '')
+        msg = f"Failed to download: {os.path.basename(file_path)}, attempts: {err.last_attempt.attempt_number}, error: [{err_msg}]"
+        logger.error(msg)
+        if os.path.dirname(file_path) == DOWNLOAD_PATH:
+            send_status_update(f"⁉️{msg}", chat_id)
+
+def get_up_args(upload_mode: str, file_path: str, file_id: str, chat_id: int) -> Dict[str, Union[str, bool]]:
+    if "L" in upload_mode:
+        in_group = True if "G" in upload_mode else False
+        up_args = {"upload": False, "leech": True, "in_group": in_group}
+    elif "M" in upload_mode:
+        up_args = {"upload": False, "leech": False}
+    else:
+        up_args = {"upload": True, "leech": False}
+    up_args["extract"] = True if "E" in upload_mode and magic.from_file(file_path, mime=True) in ArchiveMimetypes else False
+    up_args["file_path"] = file_path
+    up_args["task_id"] = file_id
+    up_args["chat_id"] = chat_id
+    return up_args
+
+async def gdrive_files_handler(item_id: str, file_list: Dict[str, str], _file_path: str, gdrive_service, file_size: int, tg_msg: Message,
+                               update: Update, context: ContextTypes.DEFAULT_TYPE, _loop: asyncio.events.AbstractEventLoop,
+                               upload_mode: str, _folder_name: Optional[str] = None):
+    down_prog = UpDownProgressUpdate(user_id=str(update.message.chat_id), total=file_size, stat_msg_id=tg_msg.message_id if tg_msg else None,
+                                     up_start_time=time.time(), action="📥 <b>Downloading</b>")
+    logger.info(f"Starting status updater for: {item_id}")
+    asyncio.run_coroutine_threadsafe(coro=down_prog.trigger_update(), loop=_loop)
+    for file_id in file_list:
+        file_name = file_list[file_id]
+        logger.info(f"Starting download: {file_name} [{file_id}]")
+        file_path = f"{_file_path}/{file_name}"
+        down_prog.file_name = file_name
+        await asyncio.to_thread(download_gdrive_file, file_id, file_path, gdrive_service, down_prog, str(update.message.chat_id))
+    down_prog.stat_msg_id = None
+    gdrive_service.close()
+    _file_names = list(file_list.values())
+    _file_name = _file_names[0]
+    if all([os.path.exists(f"{_file_path}/{file_name}") for file_name in _file_names]):
+        logger.info(f"All ({len(file_list)}) gdrive files downloaded and saved")
+        LEECH_CHAT_DICT[item_id] = update.message.chat_id
+        up_args = get_up_args(upload_mode, f"{DOWNLOAD_PATH}/{_file_name}", item_id, update.message.chat_id)
+        if _folder_name:
+            _msg = f"✅<b> GDrive folder: </b><code>{_folder_name}</code> <b>downloaded successfully</b>\n📀 <b>Size: </b><code>{humanize.naturalsize(file_size)}</code>\n" \
+                   f"📚 <b>Total files: </b><code>{len(file_list)}</code>{get_ngrok_file_url(_folder_name)}"
+            await edit_or_reply(tg_msg, _msg, update, context)
+            if up_args['leech']:
+                logger.info(f"Leeching started for {_folder_name}")
+                await trigger_tg_upload(_file_path, item_id, up_args['in_group'])
+            elif up_args['extract']:
+                await send_msg_async(f"Automatic extraction of archive file present in <code>{_folder_name}</code> is not yet supported\n"
+                                     f"You can provide the ngrok url of downloaded archive file to extract.", update.message.chat_id)
+            elif up_args['upload']:
+                logger.info(f"Uploading started for {_folder_name}")
+                await upload_to_gdrive(name=_folder_name, chat_id=str(update.message.chat_id))
+            else:
+                logger.info(f"No post download action for {_folder_name}")
+        else:
+            await edit_or_reply(tg_msg, f"✅ <b>Gdrive file: </b><code>{_file_name}</code> <b>downloaded successfully</b>\n"
+                                        f"📀 <b>Size: </b><code>{humanize.naturalsize(file_size)}</code>{get_ngrok_file_url(_file_name)}", update, context)
+            logger.info(f"calling extract_upload_tg_file() with {up_args}")
+            await extract_upload_tg_file(**up_args)
+    else:
+        _msg = f"Failed to download gdrive file: {_file_name}, Total: {len(file_list)} file, please check the log for more details"
+        logger.error(_msg)
+        await edit_or_reply(tg_msg, _msg, update, context)
+
+async def gdrive_handler(link: str, upload_mode: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info(f"Finding gdrive id from {link}")
+    tg_msg = await reply_message(f"⏳ <b>Processing given link, please wait</b>", update, context)
+    try:
+        _loop = asyncio.get_running_loop()
+    except RuntimeError:
+        await edit_or_reply(tg_msg, "Failed to get async running loop, please restart the bot", update, context)
+        return
+    if file_id := get_gdrive_id(link):
+        logger.info(f"Finding the details for {file_id}")
+        try:
+            creds = get_oauth_creds()
+            async for attempt in AsyncRetrying(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=retry_if_exception_type(Exception)):
+                with attempt:
+                    gdrive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+                    _meta = gdrive_service.files().get(fileId=file_id, supportsAllDrives=True, fields='name, id, mimeType, size').execute()
+                    file_name = _meta['name'].replace('/', '')
+                    file_type = _meta['mimeType']
+        except RetryError as err:
+            last_err = err.last_attempt.exception()
+            err_msg = last_err.error_details if isinstance(last_err, HttpError) else str(last_err).replace('>', '').replace('>', '')
+            _msg = f"❗<b>Failed to get the details of GDrive ID: </b><code>{file_id}</code>\n⚠️ <b>Error: </b><code>{err_msg}</code>"
+            await edit_or_reply(tg_msg, _msg, update, context)
+        else:
+            files_dict = dict()
+            folder_name = None
+            total_size = 0
+            file_path = DOWNLOAD_PATH
+            if file_type == "application/vnd.google-apps.folder":
+                logger.info(f"Fetching details of gdrive folder: {file_name}")
+                try:
+                    async for attempt in AsyncRetrying(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=retry_if_exception_type(Exception)):
+                        with attempt:
+                            query = f"mimeType != 'application/vnd.google-apps.folder' and trashed=false and parents in '{file_id}'"
+                            files_list = gdrive_service.files().list(
+                                            supportsAllDrives=True, includeItemsFromAllDrives=True, corpora='allDrives', q=query, spaces='drive',
+                                            fields='files(id, name, size)').execute()["files"]
+                            if not files_list:
+                                logger.warning(f"No files found in folder: {file_name}")
+                                await edit_or_reply(tg_msg, f"❗<b>Given folder: </b><code>{file_name}</code> <b>is empty, please validate and retry</b>", update, context)
+                                return
+                except RetryError as err:
+                    last_err = err.last_attempt.exception()
+                    err_msg = last_err.error_details if isinstance(last_err, HttpError) else str(last_err).replace('>', '').replace('>', '')
+                    logger.error(f"Failed to fetch details of folder: {file_name} error: {err_msg}")
+                    await edit_or_reply(tg_msg, f"⁉️<b>Failed to get details of folder </b><code>{file_name}</code>\n⚠️ <b>Error: </b><code>{err_msg}</code>", update, context)
+                    return
+                else:
+                    for _file in files_list:
+                        total_size += int(_file['size'])
+                        files_dict[_file['id']] = _file['name'].replace('/', '')
+                    logger.info(f"Found {len(files_list)} files in {file_name}, total size: {humanize.naturalsize(total_size)}")
+                    folder_name = file_name
+                    file_path += f"/{file_name}"
+                    logger.info(f"Creating folder: {file_path}")
+                    os.makedirs(name=file_path, exist_ok=True)
+            else:
+                files_dict[file_id] = file_name
+                total_size = int(_meta['size'])
+            await edit_or_reply(tg_msg, f"⏳ <b>Downloading started for </b><code>{file_name}</code>", update, context)
+            logger.info(f"Calling gdrive_files_handler() for {len(files_dict)} file")
+            asyncio.run_coroutine_threadsafe(gdrive_files_handler(file_id, files_dict, file_path, gdrive_service, total_size,
+                                                                  tg_msg, update, context, _loop, upload_mode, folder_name), _loop)
+    else:
+        await edit_or_reply(tg_msg, "❗<b>Failed to get the GDrive ID from given link.</b> Please validate the link and retry", update, context)
+
 async def reply_handler(reply_doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE, upload_mode: str,
                         loop: asyncio.events.AbstractEventLoop) -> None:
     tg_file_path, tg_msg = await get_tg_file(reply_doc, update, context, loop)
@@ -1141,17 +1300,8 @@ async def reply_handler(reply_doc: Document, update: Update, context: ContextTyp
     else:
         file_path = f"{DOWNLOAD_PATH}/{reply_doc.file_name}"
         shutil.move(src=tg_file_path, dst=file_path)
-        if "L" in upload_mode:
-            in_group = True if "G" in upload_mode else False
-            up_args = {"upload": False, "leech": True, "in_group": in_group}
-        elif "M" in upload_mode:
-            up_args = {"upload": False, "leech": False}
-        else:
-            up_args = {"upload": True, "leech": False}
-        up_args["extract"] = True if "E" in upload_mode and magic.from_file(file_path, mime=True) in ArchiveMimetypes else False
-        up_args["file_path"] = file_path
-        up_args["task_id"] = reply_doc.file_id
-        up_args["chat_id"] = update.message.chat_id
+
+        up_args = get_up_args(upload_mode, file_path, reply_doc.file_id, update.message.chat_id)
         LEECH_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
         if not any([up_args['extract'], up_args['upload'], up_args['leech']]):
             await edit_or_reply(tg_msg, f"<b>File: </b><code>{reply_doc.file_name}</code> <b>is saved, use ngrok url to access</b>{get_ngrok_file_url(reply_doc.file_name)}", update, context)
@@ -1216,6 +1366,9 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
                             logger.error(f"Failed to generate direct link for: {link}, error: {str(err)}")
                             await reply_message(f"⁉️<b>Failed to generate direct link</b>\n<b>Reason: </b><code>{str(err)}</code>", update, context)
                             return
+                elif is_gdrive_link(link):
+                    asyncio.run_coroutine_threadsafe(gdrive_handler(link, upload_mode, update, context), asyncio.get_running_loop())
+                    return
                 aria_obj = aria2c.add_uris(uris=[link], options=ARIA_OPTS)
             else:
                 logger.warning(f"Invalid link: {link}")
@@ -1235,8 +1388,8 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
         await reply_message(help_txt, update, context)
     except aria2p.ClientException:
         await reply_message("❗ <b>Failed to start download, kindly check the link and retry.</b>", update, context)
-    except (error.TelegramError, FileNotFoundError):
-        await reply_message("❗<b>Failed to process the given file</b>", update, context)
+    except (error.TelegramError, FileNotFoundError, RuntimeError):
+        await reply_message(f"❗<b>Failed to process the given file</b>\n<i>Please check the /{LOG_CMD}</i>", update, context)
 
 async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip: bool = False, leech: bool = False) -> None:
     logger.info(f"/{QBIT_CMD if not unzip else UNZIP_QBIT_CMD} sent by {get_user(update)}")

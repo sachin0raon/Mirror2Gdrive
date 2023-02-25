@@ -14,7 +14,8 @@ from json import loads
 from os import path, environ
 from re import findall, match, search, sub
 from time import sleep
-from urllib.parse import quote, unquote, urlparse
+from typing import Optional
+from urllib.parse import quote, unquote, urlparse, parse_qs
 from uuid import uuid4
 from bs4 import BeautifulSoup
 from cfscrape import create_scraper
@@ -39,6 +40,21 @@ def is_mega_link(url: str) -> bool:
 
 def is_gdrive_link(url: str) -> bool:
     return "drive.google.com" in url
+
+def get_gdrive_id(url: str) -> Optional[str]:
+    _id = None
+    if "folders" in url or "file" in url:
+        regex = r"https:\/\/drive\.google\.com\/(?:drive(.*?)\/folders\/|file(.*?)?\/d\/)([-\w]+)"
+        try:
+            if res := search(regex, url):
+                _id = res.group(3)
+            else:
+                raise IndexError("GDrive ID not found")
+            parsed = urlparse(url)
+            _id = parse_qs(parsed.query)['id'][0]
+        except (IndexError, KeyError, AttributeError):
+            pass
+    return _id
 
 def is_share_link(url: str) -> bool:
     return bool(match(r'https?:\/\/.+\.gdtot\.\S+|https?:\/\/(filepress|filebee|appdrive|gdflix)\.\S+', url))
