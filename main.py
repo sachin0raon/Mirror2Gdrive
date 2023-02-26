@@ -501,25 +501,68 @@ async def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[t
             asyncio.run_coroutine_threadsafe(coro=upload_progress.trigger_update(), loop=asyncio.get_running_loop())
     except RuntimeError:
         logger.warning("Failed to start upload status task")
+    LOG_CHANNEL = int(os.getenv('LOG_CHANNEL', '0'))
+    BOT_PM = os.getenv('BOT_PM', 'True').lower() == "true"
     try:
         if media_list is not None:
-            await pyro_app.send_media_group(chat_id=user_id, media=media_list, disable_notification=True, protect_content=False)
+            if BOT_PM:
+                _msg = await pyro_app.send_media_group(chat_id=user_id, media=media_list, disable_notification=True, protect_content=False)
+                if LOG_CHANNEL:
+                    await pyro_app.copy_media_group(chat_id=LOG_CHANNEL, from_chat_id=_msg[0].chat.id, message_id=_msg[0].id)
+            elif LOG_CHANNEL:
+                await pyro_app.send_media_group(chat_id=LOG_CHANNEL, media=media_list, disable_notification=True, protect_content=False)
+            else:
+                logger.warning("Both LOG_CHANNEL and BOT_PM are not set")
         elif is_audio:
-            await pyro_app.send_audio(chat_id=user_id, audio=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                      file_name=file_name, disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes,
-                                      duration=get_duration(file_path))
+            if BOT_PM:
+                _msg = await pyro_app.send_audio(chat_id=user_id, audio=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
+                                                 file_name=file_name, disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes,
+                                                 duration=get_duration(file_path))
+                if LOG_CHANNEL:
+                    await pyro_app.copy_message(chat_id=LOG_CHANNEL, from_chat_id=_msg.chat.id, message_id=_msg.id)
+            elif LOG_CHANNEL:
+                await pyro_app.send_audio(chat_id=LOG_CHANNEL, audio=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
+                                          file_name=file_name, disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes,
+                                          duration=get_duration(file_path))
+            else:
+                logger.warning("Both LOG_CHANNEL and BOT_PM are not set")
         elif is_video:
-            await pyro_app.send_video(chat_id=user_id, video=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                      file_name=file_name, thumb=thumb, supports_streaming=True, disable_notification=True, protect_content=False,
-                                      progress=upload_progress.set_processed_bytes, duration=get_duration(file_path))
+            if BOT_PM:
+                _msg = await pyro_app.send_video(chat_id=user_id, video=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
+                                                 file_name=file_name, thumb=thumb, supports_streaming=True, disable_notification=True, protect_content=False,
+                                                 progress=upload_progress.set_processed_bytes, duration=get_duration(file_path))
+                if LOG_CHANNEL:
+                    await pyro_app.copy_message(chat_id=LOG_CHANNEL, from_chat_id=_msg.chat.id, message_id=_msg.id)
+            elif LOG_CHANNEL:
+                await pyro_app.send_video(chat_id=LOG_CHANNEL, video=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
+                                          file_name=file_name, thumb=thumb, supports_streaming=True, disable_notification=True, protect_content=False,
+                                          progress=upload_progress.set_processed_bytes, duration=get_duration(file_path))
+            else:
+                logger.warning("Both LOG_CHANNEL and BOT_PM are not set")
         elif is_photo:
-            await pyro_app.send_photo(chat_id=user_id, photo=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                      disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes)
+            if BOT_PM:
+                _msg = await pyro_app.send_photo(chat_id=user_id, photo=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
+                                                 disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes)
+                if LOG_CHANNEL:
+                    await pyro_app.copy_message(chat_id=LOG_CHANNEL, from_chat_id=_msg.chat.id, message_id=_msg.id)
+            elif LOG_CHANNEL:
+                await pyro_app.send_photo(chat_id=LOG_CHANNEL, photo=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
+                                          disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes)
+            else:
+                logger.warning("Both LOG_CHANNEL and BOT_PM are not set")
         else:
-            await pyro_app.send_document(chat_id=user_id, document=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
-                                         file_name=file_name, disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes)
+            if BOT_PM:
+                _msg = await pyro_app.send_document(chat_id=user_id, document=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
+                                                    file_name=file_name, disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes)
+                if LOG_CHANNEL:
+                    await pyro_app.copy_message(chat_id=LOG_CHANNEL, from_chat_id=_msg.chat.id, message_id=_msg.id)
+            elif LOG_CHANNEL:
+                await pyro_app.send_document(chat_id=LOG_CHANNEL, document=file_path, caption=f"<code>{file_name}</code>", parse_mode=enums.ParseMode.HTML,
+                                             file_name=file_name, disable_notification=True, protect_content=False, progress=upload_progress.set_processed_bytes)
+            else:
+                logger.warning("Both LOG_CHANNEL and BOT_PM are not set")
         logger.info(f"Tg Upload completed: {file_name} [Total items: {len(media_list)}]") if media_list else logger.info(f"Tg Upload completed: {file_name}")
-    except (ValueError, FileNotFoundError) as err:
+    except (ValueError, FileNotFoundError, IndexError) as err:
         logger.error(f"Tg Upload failed: {file_name} [{str(err)}]")
     except errors.FloodWait as err:
         logger.warning(f"Error: {err.ID}")
