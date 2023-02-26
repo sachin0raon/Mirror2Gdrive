@@ -189,35 +189,51 @@ def get_oauth_creds():
                 return None
         return credentials
 
-def count_uploaded_files(creds = None, folder_id: str = None, file_name: str = None) -> int:
-    count = 0
+async def get_gdrive_files(query: Optional[str], folder_id: str, creds) -> List[Dict[str, str]]:
+    gdrive_service = build('drive', 'v3', credentials=creds if creds is not None else get_oauth_creds(), cache_discovery=False)
+    if query is None:
+        query = f"trashed=false and parents in '{folder_id}'"
+    files_list = []
     try:
-        if folder_id is not None:
-            logger.info(f"Getting the count of files present in {folder_id}")
-            query = f"mimeType != 'application/vnd.google-apps.folder' and trashed=false and parents in '{folder_id}'"
-        else:
-            logger.info(f"Searching for: {file_name}")
-            file_name = file_name.replace("'", "\\'")
-            query = f"fullText contains '{file_name}' and trashed=false and parents in '{GDRIVE_FOLDER_ID}'"
-        gdrive_service = build('drive', 'v3', credentials=creds if creds is not None else get_oauth_creds(), cache_discovery=False)
-        files_list = gdrive_service.files().list(
-            supportsAllDrives=True, includeItemsFromAllDrives=True, corpora='allDrives', q=query,
-            spaces='drive', fields='files(id, name, size)').execute()["files"]
-        gdrive_service.close()
-        count = len(files_list)
-    except Exception as err:
-        logger.error(f"Failed to get details of {folder_id}[{err.__class__.__name__}]")
-    return count
+        async for attempt in AsyncRetrying(wait=wait_exponential(multiplier=2, min=4, max=8), stop=stop_after_attempt(2), retry=retry_if_exception_type(Exception)):
+            with attempt:
+                files_list.clear()
+                page_token = None
+                while True:
+                    response = gdrive_service.files().list(
+                        supportsAllDrives=True, includeItemsFromAllDrives=True, corpora='allDrives', q=query,
+                        spaces='drive', fields='files(id, name, size, mimeType)', pageToken=page_token, pageSize=200).execute()
+                    files_list.extend(response.get("files", []))
+                    page_token = response.get('nextPageToken')
+                    if page_token is None:
+                        break
+    except RetryError as err:
+        files_list.clear()
+        last_err = err.last_attempt.exception()
+        err_msg = last_err.error_details if isinstance(last_err, HttpError) else str(last_err).replace('>', '').replace('>', '')
+        logger.error(f"Failed to get files list, error: {err_msg}")
+    gdrive_service.close()
+    return files_list
 
-def delete_empty_folder(folder_id: str, creds = None) -> None:
-    if folder_id and not count_uploaded_files(folder_id=folder_id):
+async def count_uploaded_files(creds = None, folder_id: str = None, file_name: str = None) -> int:
+    if folder_id is not None:
+        logger.info(f"Getting the count of files present in {folder_id}")
+        query = f"mimeType != 'application/vnd.google-apps.folder' and trashed=false and parents in '{folder_id}'"
+    else:
+        logger.info(f"Searching for: {file_name}")
+        file_name = file_name.replace("'", "\\'")
+        query = f"fullText contains '{file_name}' and trashed=false and parents in '{GDRIVE_FOLDER_ID}'"
+    return len(await get_gdrive_files(query, folder_id, creds))
+
+async def delete_empty_folder(folder_id: str, creds = None) -> None:
+    if folder_id and not await count_uploaded_files(folder_id=folder_id):
         logger.info(f"Deleting empty folder: {folder_id} in GDrive")
         try:
             gdrive_service = build('drive', 'v3', credentials=creds if creds is not None else get_oauth_creds(), cache_discovery=False)
             gdrive_service.files().delete(fileId=folder_id, supportsAllDrives=True).execute()
             gdrive_service.close()
-        except Exception:
-            logger.warning(f"Failed to delete folder: {folder_id}")
+        except Exception as err:
+            logger.warning(f"Failed to delete folder: {folder_id}, error: {err.__class__.__name__}")
 
 def remove_extracted_dir(file_name: str) -> None:
     if os.path.exists(f"{DOWNLOAD_PATH}/{os.path.splitext(file_name)[0]}"):
@@ -352,7 +368,7 @@ def upload_file(file_path: str, folder_id: str, creds, task_data: str = None, fr
         except HttpError:
             pass
         if folder_id == GDRIVE_FOLDER_ID:
-            send_status_update(f"🗂️ <b>File:</b> <code>{file_name}</code> uploaded ✔️\n🌐 <b>Link:</b> {GDRIVE_BASE_URL.format(drive_file.get('id'))}")
+            send_status_update(f"🗂️ <b>File:</b> <code>{file_name}</code> uploaded ✔️\n🌐 <b>Link:</b> <a href='{GDRIVE_BASE_URL.format(drive_file.get('id'))}'>Click here</a>")
             if task_data and AUTO_DEL_TASK is True:
                 task_d = task_data.split(sep="#", maxsplit=1)
                 task_id = task_d[1]
@@ -427,14 +443,14 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
     except qbittorrentapi.exceptions.NotFound404Error:
         logger.error("Failed to get torrent hash info")
     if is_dir is True and folder_id is not None:
-        if count == count_uploaded_files(creds=creds, folder_id=folder_id):
-            send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: </b>{GDRIVE_FOLDER_BASE_URL.format(folder_id)}")
+        if count == await count_uploaded_files(creds=creds, folder_id=folder_id):
+            send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: </b><a href='{GDRIVE_FOLDER_BASE_URL.format(folder_id)}'>Click here</a>")
             if AUTO_DEL_TASK is True:
                 _args = (gid, False) if gid else (hash, True) if hash else (None, False)
                 clear_task_files(*_args)
             task_done = True
         else:
-            delete_empty_folder(folder_id, creds)
+            await delete_empty_folder(folder_id, creds)
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <i>Please check the log for more details using</i> <code>/{LOG_CMD}</code>")
     await delete_msg(_msg_id, chat_id)
     return task_done
@@ -689,8 +705,8 @@ def get_downloads_count() -> int:
         if qb_client := get_qbit_client():
             count += len(qb_client.torrents_info())
             qb_client.auth_log_out()
-    except Exception:
-        logger.error("Failed to get total count of download tasks")
+    except Exception as err:
+        logger.error(f"Failed to get total count of download tasks [{err.__class__.__name__}]")
     return count
 
 def get_ngrok_btn(file_name: str) -> Optional[InlineKeyboardButton]:
@@ -705,7 +721,7 @@ def get_ngrok_file_url(file_name: str) -> str:
     _url = ''
     try:
         if tunnels := ngrok.get_tunnels():
-            _url += f"\n🌎 <b>URL: </b>{tunnels[0].public_url}/{quote(file_name)}"
+            _url += f"\n🌎 <b>URL: </b><a href='{tunnels[0].public_url}/{quote(file_name)}'>Click here</a>"
     except ngrok.PyngrokError:
         logger.debug(f"Failed to get ngrok url for: {file_name}")
     return _url
@@ -860,7 +876,7 @@ async def trigger_upload(name: str, prog: str, file_id: str, update: Update, ori
               InlineKeyboardButton(text="🗃 Extracted", callback_data=f"{prog}-upext#{file_id}")],
              [InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]
         ))
-    elif count_uploaded_files(file_name=name) > 0:
+    elif await count_uploaded_files(file_name=name) > 0:
         msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already uploaded</b> and can be found in {GDRIVE_FOLDER_BASE_URL.format(GDRIVE_FOLDER_ID)}"
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
     else:
@@ -1117,7 +1133,7 @@ async def is_torrent_file(doc: Document, context: ContextTypes.DEFAULT_TYPE) -> 
     tg_file_path = await tg_file.download_to_drive(custom_path=f"/tmp/{tg_file.file_id}")
     return tg_file_path if magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent" else None
 
-async def edit_or_reply(msg: Message, text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def edit_or_reply(msg: Optional[Message], text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if msg is not None:
         await context.bot.edit_message_text(text=text, chat_id=msg.chat_id, message_id=msg.message_id, parse_mode=constants.ParseMode.HTML)
     else:
@@ -1178,7 +1194,15 @@ async def gdrive_files_handler(item_id: str, file_list: Dict[str, str], _file_pa
         file_name = file_list[file_id]
         logger.info(f"Starting download: {file_name} [{file_id}]")
         file_path = f"{_file_path}/{file_name}"
-        down_prog.file_name = file_name
+        _name, _ext = os.path.splitext(file_name)
+        if os.path.exists(file_path):
+            count = 1
+            for _, _, files in os.walk(_file_path):
+                for file_ in files:
+                    if file_ == file_name:
+                        count += 1
+            file_path = f"{_file_path}/{_name}_{count}{_ext}"
+        down_prog.file_name = os.path.basename(file_path)
         await asyncio.to_thread(download_gdrive_file, file_id, file_path, gdrive_service, down_prog, str(update.message.chat_id))
     down_prog.stat_msg_id = None
     gdrive_service.close()
@@ -1213,16 +1237,26 @@ async def gdrive_files_handler(item_id: str, file_list: Dict[str, str], _file_pa
         logger.error(_msg)
         await edit_or_reply(tg_msg, _msg, update, context)
 
+async def get_all_files(folder_id: str, creds) -> List[Dict[str, str]]:
+    all_files = await get_gdrive_files(query=None, folder_id=folder_id, creds=creds)
+    files_list = []
+    for _file in all_files:
+        if _file.get('mimeType') == 'application/vnd.google-apps.folder':
+            files_list.extend(await get_all_files(_file.get('id'), creds))
+        else:
+            files_list.append(_file)
+    return natsorted(seq=files_list, key=lambda k: k['name'])
+
 async def gdrive_handler(link: str, upload_mode: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"Finding gdrive id from {link}")
-    tg_msg = await reply_message(f"⏳ <b>Processing given link, please wait</b>", update, context)
     try:
         _loop = asyncio.get_running_loop()
     except RuntimeError:
-        await edit_or_reply(tg_msg, "Failed to get async running loop, please restart the bot", update, context)
+        await edit_or_reply(None, "Failed to get async running loop, please restart the bot", update, context)
         return
     if file_id := get_gdrive_id(link):
         logger.info(f"Finding the details for {file_id}")
+        tg_msg = await reply_message(f"⏳ <b>Processing given link, please wait</b>", update, context)
         try:
             creds = get_oauth_creds()
             async for attempt in AsyncRetrying(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=retry_if_exception_type(Exception)):
@@ -1243,22 +1277,10 @@ async def gdrive_handler(link: str, upload_mode: str, update: Update, context: C
             file_path = DOWNLOAD_PATH
             if file_type == "application/vnd.google-apps.folder":
                 logger.info(f"Fetching details of gdrive folder: {file_name}")
-                try:
-                    async for attempt in AsyncRetrying(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3), retry=retry_if_exception_type(Exception)):
-                        with attempt:
-                            query = f"mimeType != 'application/vnd.google-apps.folder' and trashed=false and parents in '{file_id}'"
-                            files_list = gdrive_service.files().list(
-                                            supportsAllDrives=True, includeItemsFromAllDrives=True, corpora='allDrives', q=query, spaces='drive',
-                                            fields='files(id, name, size)').execute()["files"]
-                            if not files_list:
-                                logger.warning(f"No files found in folder: {file_name}")
-                                await edit_or_reply(tg_msg, f"❗<b>Given folder: </b><code>{file_name}</code> <b>is empty, please validate and retry</b>", update, context)
-                                return
-                except RetryError as err:
-                    last_err = err.last_attempt.exception()
-                    err_msg = last_err.error_details if isinstance(last_err, HttpError) else str(last_err).replace('>', '').replace('>', '')
-                    logger.error(f"Failed to fetch details of folder: {file_name} error: {err_msg}")
-                    await edit_or_reply(tg_msg, f"⁉️<b>Failed to get details of folder </b><code>{file_name}</code>\n⚠️ <b>Error: </b><code>{err_msg}</code>", update, context)
+                files_list = await get_all_files(file_id, creds)
+                if not files_list:
+                    logger.warning(f"No files found in folder: {file_name}")
+                    await edit_or_reply(tg_msg, f"❗<b>Given folder: </b><code>{file_name}</code> <b>is empty, please validate and retry</b>", update, context)
                     return
                 else:
                     for _file in files_list:
@@ -1277,7 +1299,7 @@ async def gdrive_handler(link: str, upload_mode: str, update: Update, context: C
             asyncio.run_coroutine_threadsafe(gdrive_files_handler(file_id, files_dict, file_path, gdrive_service, total_size,
                                                                   tg_msg, update, context, _loop, upload_mode, folder_name), _loop)
     else:
-        await edit_or_reply(tg_msg, "❗<b>Failed to get the GDrive ID from given link.</b> Please validate the link and retry", update, context)
+        await edit_or_reply(None, "❗<b>Failed to get the GDrive ID from given link.</b> Please validate the link and retry", update, context)
 
 async def reply_handler(reply_doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE, upload_mode: str,
                         loop: asyncio.events.AbstractEventLoop) -> None:
@@ -1300,7 +1322,6 @@ async def reply_handler(reply_doc: Document, update: Update, context: ContextTyp
     else:
         file_path = f"{DOWNLOAD_PATH}/{reply_doc.file_name}"
         shutil.move(src=tg_file_path, dst=file_path)
-
         up_args = get_up_args(upload_mode, file_path, reply_doc.file_id, update.message.chat_id)
         LEECH_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
         if not any([up_args['extract'], up_args['upload'], up_args['leech']]):
