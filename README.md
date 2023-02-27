@@ -36,6 +36,10 @@ NGROK_AUTH_TOKEN = ""
 AUTO_DEL_TASK = False
 # For downloading files from uptobox
 UPTOBOX_TOKEN = ""
+# For sending files to log channel
+LOG_CHANNEL = ""
+# For sending files to you
+BOT_PM = True
 ```
 
 ### Build and run the docker image
