@@ -1855,12 +1855,12 @@ def start_pyrogram() -> None:
         logger.info(f"Session started, premium: {pyro_app.me.is_premium}")
     except KeyError:
         logger.error("Missing required values, please check the config")
-        exit()
+        os._exit(os.EX_CONFIG)
     except ConnectionError:
         logger.warning("Pyrogram session already started")
     except errors.RPCError as err:
         logger.error(f"Failed to start pyrogram session, error: {err.MESSAGE}")
-        exit()
+        os._exit(os.EX_UNAVAILABLE)
 
 def get_trackers(aria: bool=True) -> str:
     trackers = ''
@@ -1919,7 +1919,7 @@ def start_aria() -> None:
         logger.info("aria2c daemon started")
     except (subprocess.CalledProcessError, aria2p.client.ClientException, requests.exceptions.RequestException, OSError) as err:
         logger.error(f"Failed to start aria2c, error: {str(err)}")
-        exit()
+        os._exit(os.EX_UNAVAILABLE)
 
 def start_qbit() -> None:
     qbit_conf_path = '/usr/src/app/.config'
@@ -1938,7 +1938,7 @@ def start_qbit() -> None:
     except (subprocess.CalledProcessError, AttributeError, qbittorrentapi.exceptions.APIConnectionError,
             qbittorrentapi.exceptions.LoginFailed) as err:
         logger.error(f"Failed to start qbittorrent-nox, error: {str(err)}")
-        exit()
+        os._exit(os.EX_UNAVAILABLE)
 
 def start_ngrok() -> None:
     logger.info("Starting ngrok tunnel")
