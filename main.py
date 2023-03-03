@@ -29,12 +29,14 @@ from qbit_conf import QBIT_CONF
 from pyngrok import ngrok, conf
 from urllib.parse import quote
 from io import StringIO, FileIO
-from typing import Union, Optional, Dict, List, Tuple
+from random import choice
+from string import ascii_letters
+from typing import Union, Optional, Dict, List, Tuple, Set
 from dotenv import load_dotenv
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError, Retrying, AsyncRetrying
 from telegram import Update, error, constants, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Document, Message
 from telegram.ext.filters import Chat
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, Application
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, Application, MessageHandler, filters
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
@@ -62,15 +64,17 @@ NGROK_AUTH_TOKEN: Optional[str] = None
 GDRIVE_FOLDER_ID: Optional[str] = None
 AUTO_DEL_TASK: Optional[bool] = None
 AUTHORIZED_USERS = set()
-QBIT_STATUS_DICT = dict()
-UPLOAD_MODE_DICT = dict()
-LEECH_CHAT_DICT = dict()
+TASK_STATUS_MSG_DICT = dict()
+TASK_UPLOAD_MODE_DICT = dict()
+TASK_CHAT_DICT = dict()
+TASK_ID_DICT = dict()
+CHAT_UPDATE_MSG_DICT = dict()
 FOUR_GB = 4194304000
 TWO_GB = 2097152000
 PICKLE_FILE_NAME = "token.pickle"
 START_CMD = "start"
 MIRROR_CMD = "mirror"
-STATUS_CMD = "status"
+TASK_CMD = "task"
 INFO_CMD = "stats"
 LOG_CMD = "log"
 QBIT_CMD = "qbmirror"
@@ -105,6 +109,7 @@ GDRIVE_PERM = {
     'value': None,
     'withLink': True
 }
+LOCK = asyncio.Lock()
 
 def get_qbit_client() -> Optional[qbittorrentapi.Client]:
     try:
@@ -164,9 +169,11 @@ def send_status_update(msg: str, userid: Optional[str] = None) -> Dict[str, str]
                 chat_id = resp_json.get("chat").get("id")
                 msg_chat_dict[msg_id] = chat_id
                 response.close()
+            else:
+                logger.warning(f"Failed to send message [{json.loads(response.text).get('description')}]")
         except requests.exceptions.RequestException:
             logger.error(f"Failed to send updates to {user_id}")
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError, IndexError):
             logger.warning("Failed to get sent message detail")
     return msg_chat_dict
 
@@ -284,6 +291,27 @@ def create_folder(folder_name: str, creds) -> Optional[str]:
             logger.warning(f"Failed to set permission for: {folder_name}")
     return folder_id
 
+def get_index_link(file_path: Optional[str]) -> str:
+    _index_link = ""
+    if file_path is None:
+        return _index_link
+    _file_name = os.path.basename(file_path)
+    if link := os.getenv("INDEX_LINK", "").rstrip('/'):
+        is_video = True if magic.from_file(file_path, mime=True).startswith('video') else False
+        _link = f"{link}/{quote(_file_name, safe='')}?a=view" if is_video else f"{link}/{quote(_file_name, safe='')}"
+        _index_link = f"\n⚡ <b>Index Link: </b><a href='{_link}'>Click here</a>"
+    return _index_link
+
+def get_progress_bar(completed: int, total: int) -> str:
+    completed /= 8
+    total /= 8
+    p = 0 if total == 0 else round(completed * 100 / total)
+    p = min(max(p, 0), 100)
+    c_block = p // 7
+    p_str = '■' * c_block
+    p_str += '▢' * (14 - c_block)
+    return f"[{p_str}]"
+
 class UpDownProgressUpdate:
     def __init__(self, name: str = None, up_start_time: float = 0.0, current: int = 0, total: int = 0,
                  user_id: str = None, stat_msg_id: Optional[int] = None, delay: int = 5, action: str = "📤 <b>Uploading</b>"):
@@ -305,11 +333,11 @@ class UpDownProgressUpdate:
         try:
             await pyro_app.edit_message_text(
                   chat_id=self.user_id, message_id=self.stat_msg_id,
-                  text=f"{self.action}\n🗂️ <b>File: </b><code>{self.file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(self.total_bytes)}</code>\n"
+                  text=f"{self.action}\n🗂️ <b>File: </b><code>{self.file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(self.total_bytes)}</code>\n<code>{get_progress_bar(self.uploaded_bytes, self.total_bytes)}</code>\n"
                        f"💾 <b>Processed: </b><code>{humanize.naturalsize(self.uploaded_bytes)} [{round(number=self.uploaded_bytes * 100 / self.total_bytes, ndigits=1)}%]</code>\n"
                        f"⚡ <b>Speed: </b><code>{humanize.naturalsize(self.uploaded_bytes / (time.time() - self.up_start_time))}/s</code>")
         except errors.RPCError as err:
-            logger.warning(f"Failed to update status for {self.file_name} [{err.ID}]")
+            logger.debug(f"Failed to update status for {self.file_name} [{err.ID}]")
 
     async def trigger_update(self) -> None:
         while self.uploaded_bytes < self.total_bytes and self.stat_msg_id is not None:
@@ -368,7 +396,8 @@ def upload_file(file_path: str, folder_id: str, creds, task_data: str = None, fr
         except HttpError:
             pass
         if folder_id == GDRIVE_FOLDER_ID:
-            send_status_update(f"🗂️ <b>File:</b> <code>{file_name}</code> uploaded ✔️\n🌐 <b>Link:</b> <a href='{GDRIVE_BASE_URL.format(drive_file.get('id'))}'>Click here</a>")
+            send_status_update(f"🗂️ <b>File:</b> <code>{file_name}</code> uploaded ✔️\n🌐 <b>GDrive Link:</b> "
+                               f"<a href='{GDRIVE_BASE_URL.format(drive_file.get('id'))}'>Click here</a>{get_index_link(file_path)}")
             if task_data and AUTO_DEL_TASK is True:
                 task_d = task_data.split(sep="#", maxsplit=1)
                 task_id = task_d[1]
@@ -388,6 +417,7 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
     file_name = None
     task_done = False
     _msg_id = 0
+    file_path = None
     task_id: Optional[str] = None
     try:
         aria2c.client.save_session()
@@ -444,7 +474,8 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
         logger.error("Failed to get torrent hash info")
     if is_dir is True and folder_id is not None:
         if count == await count_uploaded_files(creds=creds, folder_id=folder_id):
-            send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>Link: </b><a href='{GDRIVE_FOLDER_BASE_URL.format(folder_id)}'>Click here</a>")
+            send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> <b>uploaded</b> ✔️\n🌐 <b>GDrive Link: </b>"
+                               f"<a href='{GDRIVE_FOLDER_BASE_URL.format(folder_id)}'>Click here</a>{get_index_link(file_path)}")
             if AUTO_DEL_TASK is True:
                 _args = (gid, False) if gid else (hash, True) if hash else (None, False)
                 clear_task_files(*_args)
@@ -476,7 +507,7 @@ def get_duration(file_path: str) -> int:
 async def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[types.InputMediaDocument]] = None,
                        is_audio: bool = False, is_video: bool = False, is_photo: bool = False, thumb: str = None) -> None:
     file_name = os.path.basename(file_path)
-    user_id = LEECH_CHAT_DICT[file_id] if file_id in LEECH_CHAT_DICT else None
+    user_id = TASK_CHAT_DICT[file_id] if file_id in TASK_CHAT_DICT else None
     if pyro_app is None:
         send_status_update(f"⚠️ <b>Skip upload: </b><code>{file_name}</code>\n<b>Reason: </b>Pyrogram session is not initialized", user_id)
         return
@@ -588,7 +619,7 @@ async def get_file_thumb(file_path: str) -> Optional[str]:
     except (ffmpeg.Error, UnidentifiedImageError, ValueError, TypeError, OSError) as err:
         logger.warning(f"Failed to get thumb for {name}{ext}[{str(err)}]")
 
-def get_file_type(file_path: str) -> Tuple[bool, bool, bool]:
+async def get_file_type(file_path: str) -> Tuple[bool, bool, bool]:
     is_audio = is_video = is_photo = False
     if os.path.exists(file_path):
         mime_type = magic.from_file(file_path, mime=True)
@@ -607,7 +638,7 @@ async def split_file(file_path: str, file_size: int, is_video: bool = True, is_a
     out_dir = f"{DOWNLOAD_PATH}/splits/{_name}"
     os.makedirs(out_dir, exist_ok=True)
     split_files_list: List[str] = []
-    user_id = LEECH_CHAT_DICT[task_id] if task_id is not None and task_id in LEECH_CHAT_DICT else None
+    user_id = TASK_CHAT_DICT[task_id] if task_id is not None and task_id in TASK_CHAT_DICT else None
     err_msg = f"❗<b>Upload failed: </b><code>{_name}{_ext}</code> <b>due to error while splitting</b>\n"
     _task_done = False
     if is_video or is_audio:
@@ -657,7 +688,7 @@ async def split_file(file_path: str, file_size: int, is_video: bool = True, is_a
     return split_files_list
 
 async def check_file_type_and_upload(task_id: str, file_path: str) -> None:
-    is_audio, is_video, is_photo = get_file_type(file_path)
+    is_audio, is_video, is_photo = await get_file_type(file_path)
     file_size = os.stat(file_path).st_size
     if (file_size > TWO_GB and not pyro_app.me.is_premium) or (file_size > FOUR_GB and pyro_app.me.is_premium):
         for _file in await split_file(file_path, file_size, is_video, is_audio, task_id):
@@ -684,7 +715,7 @@ async def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False
                     for chunk in files_chunk:
                         media_list = []
                         for file in chunk:
-                            is_audio, is_video, is_photo = get_file_type(file)
+                            is_audio, is_video, is_photo = await get_file_type(file)
                             name = os.path.basename(file)
                             if is_audio:
                                 media_list.append(types.InputMediaAudio(media=file, caption=f"<code>{name}</code>", parse_mode=enums.ParseMode.HTML,
@@ -708,7 +739,7 @@ async def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False
     except (RetryError, FileNotFoundError) as err:
         logger.error(f"Tg Upload failed: {file_name}, attempts: {err.last_attempt.attempt_number if isinstance(err, RetryError) else f'[{str(err)}]'}")
         send_status_update(f"❗<b>Upload failed: </b><code>{file_name}</code>\n<i>Check log for more details</i>",
-                           LEECH_CHAT_DICT[task_id] if task_id in LEECH_CHAT_DICT else None)
+                           TASK_CHAT_DICT[task_id] if task_id in TASK_CHAT_DICT else None)
     else:
         if AUTO_DEL_TASK is True:
             logger.info(f"Cleaning up: {file_name}")
@@ -719,29 +750,31 @@ async def trigger_tg_upload(down_path: str, task_id: str, in_group: bool = False
 def get_user(update: Update) -> Union[str, int]:
     return update.message.from_user.name if update.message.from_user.name is not None else update.message.chat_id
 
-def get_download_info(down: aria2p.Download) -> str:
-    info = f"🗂 <b>Name:</b> <code>{down.name}</code>\n🚦 <b>Status:</b> <code>{down.status}</code>\n📀 <b>Size:</b> <code>{down.total_length_string()}</code>\n"\
-            f"📥 <b>Downloaded:</b> <code>{down.completed_length_string()} ({down.progress_string()})</code>\n🧩 <b>Peers:</b> <code>{down.connections}</code>\n"\
-            f"⚡ <b>Speed:</b> <code>{down.download_speed_string()}</code>\n⏳ <b>ETA:</b> <code>{down.eta_string()}</code>"
+async def get_download_info(down: aria2p.Download) -> str:
+    info = f"╭🗂 <b>Name:</b> <code>{down.name}</code>\n├🚦 <b>Status:</b> <code>{down.status}</code> | 📀 <b>Size:</b> <code>{down.total_length_string()}</code>\n"\
+           f"├<code>{get_progress_bar(down.completed_length, down.total_length)}</code>\n├📥 <b>Downloaded:</b> <code>{down.completed_length_string()} ({down.progress_string()})</code>\n"\
+           f"├⚡ <b>Speed:</b> <code>{down.download_speed_string()}</code> | 🧩 <b>Peers:</b> <code>{down.connections}</code>\n├⏳ <b>ETA:</b> <code>{down.eta_string()}</code> "\
+           f"| 📚 <b>Total Files:</b> <code>{len(down.files)}</code>"
     if down.bittorrent is not None:
-        info += f"\n🥑 <b>Seeders:</b> <code>{down.num_seeders}</code>"
-    info += f"\n⚙️ <b>Engine: </b><code>Aria2</code>\n📚 <b>Total Files:</b> <code>{len(down.files)}</code>\n"
+        info += f"\n├🥑 <b>Seeders:</b> <code>{down.num_seeders}</code> | ⚙️ <b>Engine: </b><code>Aria2</code>\n"
+    else:
+        info += f"\n├⚙️ <b>Engine: </b><code>Aria2</code>\n"
     return info
 
-def get_qbit_info(hash: str, client: qbittorrentapi.Client = None) -> str:
+async def get_qbit_info(hash: str, client: qbittorrentapi.Client = None) -> str:
     info = ''
     for torrent in client.torrents_info(torrent_hashes=[hash]):
-        info += f"🗂 <b>Name:</b> <code>{torrent.name}</code>\n🚦 <b>Status:</b> <code>{torrent.state_enum.value}</code>\n📀 <b>Size:</b> <code>{humanize.naturalsize(torrent.total_size)}</code>\n"\
-            f"📥 <b>Downloaded:</b> <code>{humanize.naturalsize(torrent.downloaded)} ({round(number=torrent.progress * 100, ndigits=2)}%)</code>\n📦 <b>Remaining: </b><code>{humanize.naturalsize(torrent.amount_left)}</code>\n"\
-            f"🧩 <b>Peers:</b> <code>{torrent.num_leechs}</code> 🥑 <b>Seeders:</b> <code>{torrent.num_seeds}</code>\n"\
-            f"⚡ <b>Speed:</b> <code>{humanize.naturalsize(torrent.dlspeed)}/s</code> ⏳ <b>ETA:</b> <code>{humanize.naturaldelta(torrent.eta)}</code>\n⚙️ <b>Engine: </b><code>Qbittorent</code>"
+        info += f"╭🗂 <b>Name:</b> <code>{torrent.name}</code>\n├🚦 <b>Status:</b> <code>{torrent.state_enum.value}</code> | 📀 <b>Size:</b> <code>{humanize.naturalsize(torrent.total_size)}</code>\n├<code>{get_progress_bar(torrent.downloaded, torrent.total_size)}</code>\n"\
+            f"├📥 <b>Downloaded:</b> <code>{humanize.naturalsize(torrent.downloaded)} ({round(number=torrent.progress * 100, ndigits=2)}%)</code>\n├📦 <b>Remaining: </b><code>{humanize.naturalsize(torrent.amount_left)}</code> "\
+            f"| 🧩 <b>Peers:</b> <code>{torrent.num_leechs}</code>\n├⚡ <b>Speed:</b> <code>{humanize.naturalsize(torrent.dlspeed)}/s</code> | 🥑 <b>Seeders:</b> <code>{torrent.num_seeds}</code>\n"\
+            f"├⏳ <b>ETA:</b> <code>{humanize.naturaldelta(torrent.eta)}</code> "
         try:
-            info += f"\n📚 <b>Total Files:</b> <code>{len(client.torrents_files(torrent_hash=hash))}</code>\n"
+            info += f"| 📚 <b>Total Files:</b> <code>{len(client.torrents_files(torrent_hash=hash))}</code>\n├⚙️ <b>Engine: </b><code>Qbittorent</code>\n"
         except qbittorrentapi.exceptions.NotFound404Error:
-            pass
+            info += f"| ⚙️ <b>Engine: </b><code>Qbittorent</code>\n"
     return info
 
-def get_downloads_count() -> int:
+async def get_downloads_count() -> int:
     count = 0
     try:
         count += len(aria2c.get_downloads())
@@ -752,24 +785,24 @@ def get_downloads_count() -> int:
         logger.error(f"Failed to get total count of download tasks [{err.__class__.__name__}]")
     return count
 
-def get_ngrok_btn(file_name: str) -> Optional[InlineKeyboardButton]:
+async def get_ngrok_btn(file_name: str) -> Optional[InlineKeyboardButton]:
     try:
         if tunnels := ngrok.get_tunnels():
-            return InlineKeyboardButton(text="🌐 Ngrok URL", url=f"{tunnels[0].public_url}/{quote(file_name)}")
+            return InlineKeyboardButton(text="🌐 Ngrok URL", url=f"{tunnels[0].public_url}/{quote(file_name, safe='')}")
     except (IndexError, ngrok.PyngrokError):
         logger.error(f"Failed to get ngrok tunnel")
         return None
 
-def get_ngrok_file_url(file_name: str) -> str:
+async def get_ngrok_file_url(file_name: str) -> str:
     _url = ''
     try:
-        if tunnels := ngrok.get_tunnels():
-            _url += f"\n🌎 <b>URL: </b><a href='{tunnels[0].public_url}/{quote(file_name)}'>Click here</a>"
+        if tunnels := await asyncio.to_thread(ngrok.get_tunnels):
+            _url += f"\n🌎 <b>Ngrok Link: </b><a href='{tunnels[0].public_url}/{quote(file_name, safe='')}'>Click here</a>"
     except ngrok.PyngrokError:
         logger.debug(f"Failed to get ngrok url for: {file_name}")
     return _url
 
-def get_buttons(prog: str, dl_info: str) -> Dict[str, InlineKeyboardButton]:
+async def get_buttons(prog: str, dl_info: str) -> Dict[str, InlineKeyboardButton]:
     return {
         "refresh": InlineKeyboardButton(text="♻ Refresh", callback_data=f"{prog}-refresh#{dl_info}"),
         "delete": InlineKeyboardButton(text="🚫 Delete", callback_data=f"{prog}-remove#{dl_info}"),
@@ -778,11 +811,11 @@ def get_buttons(prog: str, dl_info: str) -> Dict[str, InlineKeyboardButton]:
         "pause": InlineKeyboardButton(text="⏸ Pause", callback_data=f"{prog}-pause#{dl_info}"),
         "upload": InlineKeyboardButton(text="☁️ Upload", callback_data=f"{prog}-upload#{dl_info}"),
         "extract": InlineKeyboardButton(text="🗃️ Extract", callback_data=f"{prog}-extract#{dl_info}"),
-        "show_all": InlineKeyboardButton(text=f"🔆 Show All ({get_downloads_count()})", callback_data=f"{prog}-lists")
+        "show_all": InlineKeyboardButton(text=f"🔆 Show All ({await get_downloads_count()})", callback_data=f"{prog}-lists")
     }
 
-def get_aria_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
-    buttons = get_buttons("aria", down.gid)
+async def get_aria_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
+    buttons = await get_buttons("aria", down.gid)
     action_btn = [[buttons["show_all"], buttons["delete"]]]
     if "error" == down.status:
         action_btn.insert(0, [buttons["refresh"], buttons["retry"]])
@@ -791,7 +824,7 @@ def get_aria_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
     elif "active" == down.status:
         action_btn.insert(0, [buttons["refresh"], buttons["pause"]])
     elif "complete" == down.status and down.is_metadata is False and not down.followed_by_ids:
-        if ngrok_btn := get_ngrok_btn(down.name):
+        if ngrok_btn := await get_ngrok_btn(down.name):
             if is_archive_file(down.name):
                 action_btn = [[ngrok_btn, buttons["extract"]], [buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
             else:
@@ -804,8 +837,8 @@ def get_aria_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
         action_btn = [[buttons["refresh"], buttons["delete"]], [buttons["show_all"]]]
     return InlineKeyboardMarkup(action_btn)
 
-def get_qbit_keyboard(qbit: qbittorrentapi.TorrentDictionary = None) -> InlineKeyboardMarkup:
-    buttons = get_buttons("qbit", qbit.hash)
+async def get_qbit_keyboard(qbit: qbittorrentapi.TorrentDictionary = None) -> InlineKeyboardMarkup:
+    buttons = await get_buttons("qbit", qbit.hash)
     file_name = qbit.files[0].get('name').split("/")[0] if qbit.files else qbit.get('name')
     action_btn = [[buttons["show_all"], buttons["delete"]]]
     if qbit.state_enum.is_errored:
@@ -815,7 +848,7 @@ def get_qbit_keyboard(qbit: qbittorrentapi.TorrentDictionary = None) -> InlineKe
     elif qbit.state_enum.is_downloading:
         action_btn.insert(0, [buttons["refresh"], buttons["pause"]])
     elif qbit.state_enum.is_complete or "pausedUP" == qbit.state_enum.value:
-        if ngrok_btn := get_ngrok_btn(file_name):
+        if ngrok_btn := await get_ngrok_btn(file_name):
             if is_archive_file(file_name):
                 action_btn = [[ngrok_btn, buttons["extract"]], [buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
             else:
@@ -945,7 +978,7 @@ def is_file_extracted(file_name: str) -> bool:
 async def start_extraction(name: str, prog: str, file_id: str, update: Update, upload: bool = False) -> None:
     folder_name = os.path.splitext(name)[0]
     if is_file_extracted(name):
-        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already extracted</b>{get_ngrok_file_url(folder_name)}"
+        msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already extracted</b>{await get_ngrok_file_url(folder_name)}"
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
     else:
         msg = f"🗃️ <b>Extraction started for: </b><code>{name}</code>\n⚠️ <i>Do not press the extract button again unless it has failed, you'll receive status updates on the same.</i>"
@@ -955,7 +988,7 @@ async def start_extraction(name: str, prog: str, file_id: str, update: Update, u
         os.makedirs(name=f"{DOWNLOAD_PATH}/{folder_name}", exist_ok=True)
         try:
             await asyncio.to_thread(patoolib.extract_archive, archive=f"{DOWNLOAD_PATH}/{name}", outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
-            msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️{get_ngrok_file_url(folder_name)}"
+            msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️{await get_ngrok_file_url(folder_name)}"
             send_status_update(msg)
             if upload is True:
                 try:
@@ -984,10 +1017,14 @@ async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     aria2c.pause(downloads=[aria_obj], force=True)
                 elif "resume" in action:
                     aria2c.resume(downloads=[aria_obj])
-                await edit_message(get_download_info(aria_obj.live), update.callback_query, get_aria_keyboard(aria_obj))
+                await edit_message(await get_download_info(aria_obj.live), update.callback_query, await get_aria_keyboard(aria_obj))
             elif action in ["aria-retry", "aria-remove", "aria-lists"]:
                 if "retry" in action:
                     aria2c.retry_downloads(downloads=[aria_obj], clean=False)
+                    for item in aria2c.get_downloads():
+                        if item.gid not in TASK_CHAT_DICT:
+                            TASK_CHAT_DICT[item.gid] = update.callback_query.message.chat_id
+                            TASK_ID_DICT[item.gid] = ''.join(choice(ascii_letters) for i in range(8))
                 elif "remove" in action:
                     remove_extracted_dir(aria_obj.name)
                     aria2c.remove(downloads=[aria_obj], force=True, files=True, clean=True)
@@ -1012,8 +1049,8 @@ async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                         qb_client.torrents_pause(torrent_hashes=[torrent_hash])
                     elif "resume" in action:
                         qb_client.torrents_resume(torrent_hashes=[torrent_hash])
-                    if msg := get_qbit_info(torrent_hash, qb_client):
-                        await edit_message(msg, update.callback_query, get_qbit_keyboard(qb_client.torrents_info(torrent_hashes=[torrent_hash])[0]))
+                    if msg := await get_qbit_info(torrent_hash, qb_client):
+                        await edit_message(msg, update.callback_query, await get_qbit_keyboard(qb_client.torrents_info(torrent_hashes=[torrent_hash])[0]))
                     else:
                         await edit_message("<b>Torrent not found</b> ❗", update.callback_query)
                 elif action in ["qbit-retry", "qbit-remove", "qbit-lists"]:
@@ -1093,7 +1130,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
              (UNZIP_QBIT_CMD, "🫧 Mirror & unzip using Qbittorrent"),
              (LEECH_QBIT_CMD, "🌀 Leech file using Qbittorrent"),
              (UNZIP_LEECH_CMD, "🧬 Unzip and leech"),
-             (STATUS_CMD, "📥 Show the task list"),
+             (TASK_CMD, "📥 Show the task list"),
              (INFO_CMD, "⚙️ Show system info"),
              (NGROK_CMD, "🌍 Show Ngrok URL"),
              (LOG_CMD, "📄 Get runtime log file")]
@@ -1154,7 +1191,7 @@ async def extract_upload_tg_file(file_path: str, upload: bool = False, leech: bo
             await asyncio.to_thread(patoolib.extract_archive, archive=file_path, outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
             msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️"
             if not upload and not leech:
-                msg += get_ngrok_file_url(folder_name)
+                msg += await get_ngrok_file_url(folder_name)
             await send_msg_async(msg, chat_id)
         if upload is True and await upload_to_gdrive(name=folder_name, chat_id=chat_id) is True:
             logger.info(f"Cleaning up: {name}")
@@ -1253,11 +1290,11 @@ async def gdrive_files_handler(item_id: str, file_list: Dict[str, str], _file_pa
     _file_name = _file_names[0]
     if all([os.path.exists(f"{_file_path}/{file_name}") for file_name in _file_names]):
         logger.info(f"All ({len(file_list)}) gdrive files downloaded and saved")
-        LEECH_CHAT_DICT[item_id] = update.message.chat_id
+        TASK_CHAT_DICT[item_id] = update.message.chat_id
         up_args = get_up_args(upload_mode, f"{DOWNLOAD_PATH}/{_file_name}", item_id, update.message.chat_id)
         if _folder_name:
             _msg = f"✅<b> GDrive folder: </b><code>{_folder_name}</code> <b>downloaded successfully</b>\n📀 <b>Size: </b><code>{humanize.naturalsize(file_size)}</code>\n" \
-                   f"📚 <b>Total files: </b><code>{len(file_list)}</code>{get_ngrok_file_url(_folder_name)}"
+                   f"📚 <b>Total files: </b><code>{len(file_list)}</code>{await get_ngrok_file_url(_folder_name)}"
             await edit_or_reply(tg_msg, _msg, update, context)
             if up_args['leech']:
                 logger.info(f"Leeching started for {_folder_name}")
@@ -1272,7 +1309,7 @@ async def gdrive_files_handler(item_id: str, file_list: Dict[str, str], _file_pa
                 logger.info(f"No post download action for {_folder_name}")
         else:
             await edit_or_reply(tg_msg, f"✅ <b>Gdrive file: </b><code>{_file_name}</code> <b>downloaded successfully</b>\n"
-                                        f"📀 <b>Size: </b><code>{humanize.naturalsize(file_size)}</code>{get_ngrok_file_url(_file_name)}", update, context)
+                                        f"📀 <b>Size: </b><code>{humanize.naturalsize(file_size)}</code>{await get_ngrok_file_url(_file_name)}", update, context)
             logger.info(f"calling extract_upload_tg_file() with {up_args}")
             await extract_upload_tg_file(**up_args)
     else:
@@ -1353,10 +1390,10 @@ async def reply_handler(reply_doc: Document, update: Update, context: ContextTyp
         logger.info(f"Adding file to download: {reply_doc.file_name}")
         try:
             aria_obj = aria2c.add_torrent(torrent_file_path=tg_file_path)
-            UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
-            LEECH_CHAT_DICT[aria_obj.gid] = update.message.chat_id
+            TASK_UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
+            TASK_CHAT_DICT[aria_obj.gid] = update.message.chat_id
             if aria_obj.has_failed is False:
-                _msg = f"📥 <b>Download started</b> ✔️\n<i>Send /{STATUS_CMD} to view</i>"
+                _msg = f"📥 <b>Download started</b> ✔"
             else:
                 _msg = f"⚠️ <b>Failed to start download</b>\nError :<code>{aria_obj.error_message}</code>"
         except aria2p.ClientException as err:
@@ -1366,11 +1403,21 @@ async def reply_handler(reply_doc: Document, update: Update, context: ContextTyp
         file_path = f"{DOWNLOAD_PATH}/{reply_doc.file_name}"
         shutil.move(src=tg_file_path, dst=file_path)
         up_args = get_up_args(upload_mode, file_path, reply_doc.file_id, update.message.chat_id)
-        LEECH_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
+        TASK_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
         if not any([up_args['extract'], up_args['upload'], up_args['leech']]):
-            await edit_or_reply(tg_msg, f"<b>File: </b><code>{reply_doc.file_name}</code> <b>is saved, use ngrok url to access</b>{get_ngrok_file_url(reply_doc.file_name)}", update, context)
+            await edit_or_reply(tg_msg, f"<b>File: </b><code>{reply_doc.file_name}</code> <b>is saved, use ngrok url to "
+                                        f"access</b>{await get_ngrok_file_url(reply_doc.file_name)}", update, context)
         logger.info(f"calling extract_upload_tg_file() with {up_args}")
         await extract_upload_tg_file(**up_args)
+
+async def delete_download_status() -> None:
+    to_be_del = set()
+    async with LOCK:
+        for chat_id in CHAT_UPDATE_MSG_DICT:
+            await delete_msg(CHAT_UPDATE_MSG_DICT[chat_id], chat_id)
+            to_be_del.add(chat_id)
+        for _chat_id in to_be_del:
+            CHAT_UPDATE_MSG_DICT.pop(_chat_id)
 
 async def get_upload_mode(cmd_txt: List[str], unzip: bool, leech: bool) -> str:
     if len(cmd_txt) > 1:
@@ -1440,9 +1487,11 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
         if aria_obj is not None:
             if aria_obj.has_failed is False:
                 logger.info(f"Download started: {aria_obj.name} with GID: {aria_obj.gid}")
-                UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
-                LEECH_CHAT_DICT[aria_obj.gid] = update.message.chat_id
-                await reply_message(f"📥 <b>Download started</b> ✔️\n<i>Send /{STATUS_CMD} to view</i>", update, context)
+                TASK_UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
+                TASK_CHAT_DICT[aria_obj.gid] = update.message.chat_id
+                TASK_ID_DICT[aria_obj.gid] = ''.join(choice(ascii_letters) for i in range(8))
+                await reply_message(f"📥 <b>Download started</b> ✔", update, context)
+                await delete_download_status()
             else:
                 logger.error(f"Failed to start download, error: {aria_obj.error_code}")
                 await reply_message(f"⚠️ <b>Failed to start download</b>\nError:<code>{aria_obj.error_message}</code> ❗", update, context)
@@ -1484,11 +1533,13 @@ async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
             if link is not None:
                 resp = qb_client.torrents_add(urls=link)
             if resp is not None and resp == "Ok.":
-                await reply_message(f"🧲 <b>Torrent added</b> ✔️\n<i>Send /{STATUS_CMD} to view</i>", update, context)
+                await reply_message(f"🧲 <b>Torrent added</b> ✔", update, context)
+                await delete_download_status()
                 for torrent in qb_client.torrents_info(status_filter='all', sort='added_on', reverse=True, limit=1):
-                    UPLOAD_MODE_DICT[torrent.get('hash')] = upload_mode
-                    LEECH_CHAT_DICT[torrent.get('hash')] = update.message.chat_id
-                    QBIT_STATUS_DICT[torrent.get('hash')] = "NOT_SENT"
+                    TASK_UPLOAD_MODE_DICT[torrent.get('hash')] = upload_mode
+                    TASK_CHAT_DICT[torrent.get('hash')] = update.message.chat_id
+                    TASK_STATUS_MSG_DICT[torrent.get('hash')] = "NOT_SENT"
+                    TASK_ID_DICT[torrent.get('hash')] = ''.join(choice(ascii_letters) for i in range(8))
             else:
                 await reply_message("❗ <b>Failed to add it</b>\n⚠️ <i>Kindly verify the given link and retry</i>", update, context)
         except IndexError:
@@ -1515,6 +1566,116 @@ async def qbit_mirror_leech(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def aria_unzip_leech(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await aria_upload(update, context, True, True)
 
+async def action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.text.startswith('#'):
+        _action = update.message.text.split('_', maxsplit=1)
+        is_pause = is_retry = is_cancel = is_resume = is_aria = False
+        status_msg = ''
+        try:
+            _task_id = _action[1]
+            _ids = list(TASK_ID_DICT.values())
+            if _task_id not in _ids:
+                await reply_message("❗<b>Unable to find any task with the given ID</b>", update, context)
+                return
+            else:
+                input_act = _action[0].lstrip('#')
+                if input_act == "pause":
+                    is_pause = True
+                elif input_act == "resume":
+                    is_resume = True
+                elif input_act == "retry":
+                    is_retry = True
+                elif input_act == "cancel":
+                    is_cancel = True
+                else:
+                    raise ValueError
+                task_id = list(TASK_ID_DICT.keys())[_ids.index(_task_id)]
+                for d in aria2c.get_downloads():
+                    if d.gid == task_id:
+                        is_aria = True
+                        break
+                if is_aria:
+                    aria_obj = aria2c.get_download(task_id)
+                    _name = aria_obj.name
+                    status_msg += f"🗂️ <code>{_name}</code> "
+                    if is_pause:
+                        aria2c.pause(downloads=[aria_obj], force=True)
+                        status_msg += "<b>is paused</b>"
+                    elif is_resume:
+                        aria2c.resume(downloads=[aria_obj])
+                        status_msg += "<b>is resumed</b>"
+                    elif is_retry:
+                        aria2c.retry_downloads(downloads=[aria_obj], clean=False)
+                        status_msg += ": <b>retry request submitted</b>"
+                        for item in aria2c.get_downloads():
+                            if item.gid not in TASK_CHAT_DICT:
+                                TASK_CHAT_DICT[item.gid] = update.message.chat_id
+                                TASK_ID_DICT[item.gid] = ''.join(choice(ascii_letters) for i in range(8))
+                    elif is_cancel:
+                        remove_extracted_dir(_name)
+                        aria2c.remove(downloads=[aria_obj], force=True, files=True, clean=True)
+                        status_msg += "<b>is removed</b>"
+                elif qb_client := get_qbit_client():
+                    if qb_client.torrents_files(task_id):
+                        _name = qb_client.torrents_files(task_id)[0].get('name').split("/")[0]
+                    else:
+                        _name = qb_client.torrents_info(torrent_hashes=[task_id])[0].get('name')
+                    status_msg += f"🗂️ <code>{_name}</code> "
+                    if is_pause:
+                        qb_client.torrents_pause(torrent_hashes=[task_id])
+                        status_msg += "<b>is paused</b>"
+                    elif is_resume:
+                        qb_client.torrents_resume(torrent_hashes=[task_id])
+                        status_msg += "<b>is resumed</b>"
+                    elif is_retry:
+                        qb_client.torrents_set_force_start(enable=True, torrent_hashes=[task_id])
+                        status_msg += ": <b>retry request submitted</b>"
+                    elif is_cancel:
+                        remove_extracted_dir(_name)
+                        qb_client.torrents_delete(delete_files=True, torrent_hashes=[task_id])
+                        status_msg += "<b>is removed</b>"
+            if status_msg:
+                await reply_message(status_msg, update, context)
+                await delete_download_status()
+            else:
+                await reply_message("⚠️ <b>Unable to find any task associated with the given ID</b>", update, context)
+        except (IndexError, ValueError):
+            await reply_message("⚠️ <b>Unsupported command sent</b>", update, context)
+        except (aria2p.ClientException, qbittorrentapi.exceptions.APIError) as err:
+            logger.error(f"Failed to process: {update.message.text}[{err.__class__.__name__}]")
+            await reply_message(f"⁉️<b>Failed to process the request [{err.__class__.__name__}]</b>", update, context)
+        except RuntimeError:
+            pass
+
+async def get_action_str(task: Union[aria2p.Download, qbittorrentapi.TorrentDictionary]) -> str:
+    action_str = ''
+    _retry = "├♻️ <b>Retry: </b><code>#retry_{}</code>\n"
+    _pause = "├⏸ <b>Pause: </b><code>#pause_{}</code>\n"
+    _resume = "├▶ <b>Resume: </b><code>#resume_{}</code>\n"
+    _cancel = "╰❌ <b>Cancel: </b><code>#cancel_{}</code>\n"
+    if isinstance(task, aria2p.Download):
+        task_id = TASK_ID_DICT.get(task.gid, '')
+        if not task_id:
+            return action_str
+        if "error" == task.status:
+            action_str += _retry.format(task_id)
+        elif "paused" == task.status:
+            action_str += _resume.format(task_id)
+        elif task.is_active:
+            action_str += _pause.format(task_id)
+    else:
+        task_id = TASK_ID_DICT.get(task.hash, '')
+        if not task_id:
+            return action_str
+        if task.state_enum.is_errored:
+            action_str += _retry.format(task_id)
+        elif "pausedDL" == task.state_enum.value:
+            action_str += _resume.format(task_id)
+        elif task.state_enum.is_downloading:
+            action_str += _pause.format(task_id)
+    action_str += _cancel.format(task_id)
+    return action_str
+
 async def extract_and_upload(torrent: Union[aria2p.Download, qbittorrentapi.TorrentDictionary], upload: bool = True,
                              leech: bool = False, in_group: bool = False) -> None:
     if isinstance(torrent, qbittorrentapi.TorrentDictionary):
@@ -1523,7 +1684,7 @@ async def extract_and_upload(torrent: Union[aria2p.Download, qbittorrentapi.Torr
     else:
         file_name = torrent.name
         file_id = torrent.gid
-    chat_id = LEECH_CHAT_DICT[file_id] if file_id in LEECH_CHAT_DICT else None
+    chat_id = TASK_CHAT_DICT[file_id] if file_id in TASK_CHAT_DICT else None
     if is_archive_file(file_name):
         if is_file_extracted(file_name):
             msg = f"🗂️ <b>File:</b> <code>{file_name}</code> is already <b>extracted</b> ✔️"
@@ -1547,10 +1708,10 @@ async def extract_and_upload(torrent: Union[aria2p.Download, qbittorrentapi.Torr
                     await trigger_tg_upload(f"{DOWNLOAD_PATH}/{folder_name}", file_id, in_group)
 
 async def trigger_extract_upload(torrent: Union[aria2p.Download, qbittorrentapi.TorrentDictionary], task_id: str) -> None:
-    if task_id in UPLOAD_MODE_DICT:
-        upload_mode = UPLOAD_MODE_DICT.get(task_id)
+    if task_id in TASK_UPLOAD_MODE_DICT:
+        upload_mode = TASK_UPLOAD_MODE_DICT.get(task_id)
         up_arg = {'gid': task_id} if isinstance(torrent, aria2p.Download) else {'hash': task_id}
-        up_arg['chat_id'] = LEECH_CHAT_DICT[task_id] if task_id in LEECH_CHAT_DICT else None
+        up_arg['chat_id'] = TASK_CHAT_DICT[task_id] if task_id in TASK_CHAT_DICT else None
         if isinstance(torrent, qbittorrentapi.TorrentDictionary):
             file_name = torrent.files[0].get('name').split("/")[0] if torrent.files else torrent.get('name')
         else:
@@ -1582,50 +1743,76 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             total_downloads.extend([torrent for torrent in qb_client.torrents_info(status_filter="all")])
             total_downloads.extend([down for down in aria2c.get_downloads()])
-            for torrent in total_downloads:
+            target_chat_ids: Set[int] = set()
+            dl_report = ''
+            for torrent in natsorted(seq=total_downloads,
+                                     key=lambda x: x.name if isinstance(x, aria2p.Download) else x.get('name')):
                 if isinstance(torrent, qbittorrentapi.TorrentDictionary):
-                    present_in_dict = torrent.get('hash') in QBIT_STATUS_DICT
+                    present_in_dict = torrent.get('hash') in TASK_STATUS_MSG_DICT
                     if torrent.state_enum.is_complete or "pausedUP" == torrent.state_enum.value:
                         if present_in_dict:
-                            if QBIT_STATUS_DICT.get(torrent.get('hash')) == "NOT_SENT":
+                            if TASK_STATUS_MSG_DICT.get(torrent.get('hash')) == "NOT_SENT":
                                 msg = f"✅ <b>Downloaded: </b><code>{torrent.get('name')}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(torrent.get('size'))}</code>\n" \
                                       f"⏳ <b>Time taken: </b><code>{humanize.naturaldelta(torrent.get('completion_on') - torrent.get('added_on'))}</code>"
                                 file_name = torrent.files[0].get('name').split("/")[0] if torrent.files else torrent.get('name')
-                                msg += get_ngrok_file_url(file_name)
+                                msg += await get_ngrok_file_url(file_name)
                                 send_status_update(msg)
-                                QBIT_STATUS_DICT[torrent.get('hash')] = "SENT"
+                                TASK_STATUS_MSG_DICT[torrent.get('hash')] = "SENT"
                                 asyncio.run_coroutine_threadsafe(coro=trigger_extract_upload(torrent, torrent.get('hash')), loop=asyncio.get_running_loop())
-                    if torrent.state_enum.is_errored:
+                    elif torrent.state_enum.is_errored:
+                        dl_report += f"{await get_qbit_info(torrent.get('hash'), qb_client)}{await get_action_str(torrent)}\n"
                         if present_in_dict:
-                            if QBIT_STATUS_DICT.get(torrent.get('hash')) == "NOT_SENT":
+                            if TASK_STATUS_MSG_DICT.get(torrent.get('hash')) == "NOT_SENT":
                                 send_status_update(f"❌ <b>Failed to download: </b><code>{torrent.get('name')}</code>")
-                                QBIT_STATUS_DICT[torrent.get('hash')] = "SENT"
+                                TASK_STATUS_MSG_DICT[torrent.get('hash')] = "SENT"
+                    else:
+                        dl_report += f"{await get_qbit_info(torrent.get('hash'), qb_client)}{await get_action_str(torrent)}\n"
                     if not present_in_dict:
-                        QBIT_STATUS_DICT[torrent.get('hash')] = "NOT_SENT"
+                        TASK_STATUS_MSG_DICT[torrent.get('hash')] = "NOT_SENT"
+                    if torrent.get('hash') in TASK_CHAT_DICT:
+                        target_chat_ids.add(TASK_CHAT_DICT[torrent.get('hash')])
                 else:
                     down = torrent
                     if down.is_complete:
                         if not down.is_metadata and not down.followed_by_ids:
-                            if down.gid in QBIT_STATUS_DICT and QBIT_STATUS_DICT[down.gid] == "NOT_SENT":
-                                msg = f"✅ <b>Downloaded: </b><code>{down.name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(down.total_length)}</code>{get_ngrok_file_url(down.name)}"
+                            if down.gid in TASK_STATUS_MSG_DICT and TASK_STATUS_MSG_DICT[down.gid] == "NOT_SENT":
+                                msg = f"✅ <b>Downloaded: </b><code>{down.name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(down.total_length)}</code>{await get_ngrok_file_url(down.name)}"
                                 send_status_update(msg)
-                                QBIT_STATUS_DICT[down.gid] = "SENT"
+                                TASK_STATUS_MSG_DICT[down.gid] = "SENT"
                                 asyncio.run_coroutine_threadsafe(coro=trigger_extract_upload(down, down.gid), loop=asyncio.get_running_loop())
                         else:
                             for fgid in down.followed_by_ids:
-                                UPLOAD_MODE_DICT[fgid] = UPLOAD_MODE_DICT.get(down.gid) if down.gid in UPLOAD_MODE_DICT else "M"
-                                LEECH_CHAT_DICT[fgid] = LEECH_CHAT_DICT.get(down.gid) if down.gid in LEECH_CHAT_DICT else None
+                                TASK_UPLOAD_MODE_DICT[fgid] = TASK_UPLOAD_MODE_DICT.get(down.gid) if down.gid in TASK_UPLOAD_MODE_DICT else "M"
+                                TASK_CHAT_DICT[fgid] = TASK_CHAT_DICT.get(down.gid) if down.gid in TASK_CHAT_DICT else None
                             logger.info(f"Removing file: {down.name}")
                             aria2c.remove(downloads=[down])
-                    if down.has_failed:
-                        if down.gid in QBIT_STATUS_DICT and QBIT_STATUS_DICT[down.gid] == "NOT_SENT":
+                    elif down.has_failed:
+                        dl_report += f"{await get_download_info(down)}{await get_action_str(down)}\n"
+                        if down.gid in TASK_STATUS_MSG_DICT and TASK_STATUS_MSG_DICT[down.gid] == "NOT_SENT":
                             send_status_update(f"⁉️<b>Failed to download: </b><code>{down.name}</code> [{down.error_message}]")
-                            QBIT_STATUS_DICT[down.gid] = "SENT"
-                    if down.gid not in QBIT_STATUS_DICT:
-                        QBIT_STATUS_DICT[down.gid] = "NOT_SENT"
+                            TASK_STATUS_MSG_DICT[down.gid] = "SENT"
+                    else:
+                        dl_report += f"{await get_download_info(down)}{await get_action_str(down)}\n"
+                    if down.gid not in TASK_STATUS_MSG_DICT:
+                        TASK_STATUS_MSG_DICT[down.gid] = "NOT_SENT"
+                    if down.gid in TASK_CHAT_DICT:
+                        target_chat_ids.add(TASK_CHAT_DICT[down.gid])
+            for chat_id in target_chat_ids:
+                async with LOCK:
+                    chat_id_present = chat_id in CHAT_UPDATE_MSG_DICT
+                    if dl_report:
+                        if not chat_id_present:
+                            msg_id = await send_msg_async(dl_report, chat_id)
+                            CHAT_UPDATE_MSG_DICT[chat_id] = msg_id
+                        else:
+                            await pyro_app.edit_message_text(chat_id=chat_id, message_id=CHAT_UPDATE_MSG_DICT[chat_id], text=dl_report)
+            if not dl_report or not target_chat_ids:
+                await delete_download_status()
             qb_client.auth_log_out()
         except (qbittorrentapi.APIConnectionError, aria2p.ClientException, RuntimeError) as err:
             logger.warning(f"Error in aria qbit listener [{str(err)}]")
+        except errors.RPCError as err:
+            logger.debug(f"Failed to update download status [{err.ID}]")
 
 def start_bot() -> None:
     global BOT_START_TIME
@@ -1640,7 +1827,7 @@ def start_bot() -> None:
         try:
             start_handler = CommandHandler(START_CMD, start, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             aria_handler = CommandHandler(MIRROR_CMD, aria_upload, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
-            status_handler = CommandHandler(STATUS_CMD, get_total_downloads, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
+            status_handler = CommandHandler(TASK_CMD, get_total_downloads, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             info_handler = CommandHandler(INFO_CMD, sys_info_handler, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             log_handler = CommandHandler(LOG_CMD, send_log_file, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             qbit_handler = CommandHandler(QBIT_CMD, qbit_upload, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
@@ -1650,10 +1837,11 @@ def start_bot() -> None:
             leech_aria = CommandHandler(LEECH_ARIA_CMD, aria_mirror_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             leech_qbit = CommandHandler(LEECH_QBIT_CMD, qbit_mirror_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
             unzip_leech_aria = CommandHandler(UNZIP_LEECH_CMD, aria_unzip_leech, Chat(chat_id=AUTHORIZED_USERS, allow_empty=False))
+            task_action_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, action_handler)
             callback_handler = CallbackQueryHandler(bot_callback_handler, pattern="^aria|qbit|sys")
-            application.add_handlers([start_handler, aria_handler, callback_handler, status_handler, info_handler, log_handler,
+            application.add_handlers([start_handler, aria_handler, callback_handler, status_handler, info_handler, log_handler, task_action_handler,
                                       qbit_handler, ngrok_handler, unzip_aria, unzip_qbit, leech_aria, leech_qbit, unzip_leech_aria])
-            application.job_queue.run_repeating(callback=aria_qbit_listener, interval=15, name="aria_qbit_listener")
+            application.job_queue.run_repeating(callback=aria_qbit_listener, interval=6, name="aria_qbit_listener")
             application.run_polling(drop_pending_updates=True)
         except error.TelegramError as err:
             logger.error(f"Failed to start bot: {str(err)}")
@@ -1679,12 +1867,12 @@ def start_pyrogram() -> None:
         logger.info(f"Session started, premium: {pyro_app.me.is_premium}")
     except KeyError:
         logger.error("Missing required values, please check the config")
-        exit()
+        os._exit(os.EX_CONFIG)
     except ConnectionError:
         logger.warning("Pyrogram session already started")
     except errors.RPCError as err:
         logger.error(f"Failed to start pyrogram session, error: {err.MESSAGE}")
-        exit()
+        os._exit(os.EX_UNAVAILABLE)
 
 def get_trackers(aria: bool=True) -> str:
     trackers = ''
@@ -1743,7 +1931,7 @@ def start_aria() -> None:
         logger.info("aria2c daemon started")
     except (subprocess.CalledProcessError, aria2p.client.ClientException, requests.exceptions.RequestException, OSError) as err:
         logger.error(f"Failed to start aria2c, error: {str(err)}")
-        exit()
+        os._exit(os.EX_UNAVAILABLE)
 
 def start_qbit() -> None:
     qbit_conf_path = '/usr/src/app/.config'
@@ -1762,7 +1950,7 @@ def start_qbit() -> None:
     except (subprocess.CalledProcessError, AttributeError, qbittorrentapi.exceptions.APIConnectionError,
             qbittorrentapi.exceptions.LoginFailed) as err:
         logger.error(f"Failed to start qbittorrent-nox, error: {str(err)}")
-        exit()
+        os._exit(os.EX_UNAVAILABLE)
 
 def start_ngrok() -> None:
     logger.info("Starting ngrok tunnel")
