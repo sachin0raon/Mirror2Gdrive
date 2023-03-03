@@ -302,6 +302,16 @@ def get_index_link(file_path: Optional[str]) -> str:
         _index_link = f"\n⚡ <b>Index Link: </b><a href='{_link}'>Click here</a>"
     return _index_link
 
+def get_progress_bar(completed: int, total: int) -> str:
+    completed /= 8
+    total /= 8
+    p = 0 if total == 0 else round(completed * 100 / total)
+    p = min(max(p, 0), 100)
+    c_block = p // 7
+    p_str = '■' * c_block
+    p_str += '▢' * (14 - c_block)
+    return f"[{p_str}]"
+
 class UpDownProgressUpdate:
     def __init__(self, name: str = None, up_start_time: float = 0.0, current: int = 0, total: int = 0,
                  user_id: str = None, stat_msg_id: Optional[int] = None, delay: int = 5, action: str = "📤 <b>Uploading</b>"):
@@ -323,7 +333,7 @@ class UpDownProgressUpdate:
         try:
             await pyro_app.edit_message_text(
                   chat_id=self.user_id, message_id=self.stat_msg_id,
-                  text=f"{self.action}\n🗂️ <b>File: </b><code>{self.file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(self.total_bytes)}</code>\n"
+                  text=f"{self.action}\n🗂️ <b>File: </b><code>{self.file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(self.total_bytes)}</code>\n<code>{get_progress_bar(self.uploaded_bytes, self.total_bytes)}</code>\n"
                        f"💾 <b>Processed: </b><code>{humanize.naturalsize(self.uploaded_bytes)} [{round(number=self.uploaded_bytes * 100 / self.total_bytes, ndigits=1)}%]</code>\n"
                        f"⚡ <b>Speed: </b><code>{humanize.naturalsize(self.uploaded_bytes / (time.time() - self.up_start_time))}/s</code>")
         except errors.RPCError as err:
@@ -742,8 +752,9 @@ def get_user(update: Update) -> Union[str, int]:
 
 async def get_download_info(down: aria2p.Download) -> str:
     info = f"╭🗂 <b>Name:</b> <code>{down.name}</code>\n├🚦 <b>Status:</b> <code>{down.status}</code> | 📀 <b>Size:</b> <code>{down.total_length_string()}</code>\n"\
-           f"├📥 <b>Downloaded:</b> <code>{down.completed_length_string()} ({down.progress_string()})</code>\n├⚡ <b>Speed:</b> <code>{down.download_speed_string()}</code> "\
-           f"| 🧩 <b>Peers:</b> <code>{down.connections}</code>\n├⏳ <b>ETA:</b> <code>{down.eta_string()}</code> | 📚 <b>Total Files:</b> <code>{len(down.files)}</code>"
+           f"├<code>{get_progress_bar(down.completed_length, down.total_length)}</code>\n├📥 <b>Downloaded:</b> <code>{down.completed_length_string()} ({down.progress_string()})</code>\n"\
+           f"├⚡ <b>Speed:</b> <code>{down.download_speed_string()}</code> | 🧩 <b>Peers:</b> <code>{down.connections}</code>\n├⏳ <b>ETA:</b> <code>{down.eta_string()}</code> "\
+           f"| 📚 <b>Total Files:</b> <code>{len(down.files)}</code>"
     if down.bittorrent is not None:
         info += f"\n├🥑 <b>Seeders:</b> <code>{down.num_seeders}</code> | ⚙️ <b>Engine: </b><code>Aria2</code>\n"
     else:
@@ -753,7 +764,7 @@ async def get_download_info(down: aria2p.Download) -> str:
 async def get_qbit_info(hash: str, client: qbittorrentapi.Client = None) -> str:
     info = ''
     for torrent in client.torrents_info(torrent_hashes=[hash]):
-        info += f"╭🗂 <b>Name:</b> <code>{torrent.name}</code>\n├🚦 <b>Status:</b> <code>{torrent.state_enum.value}</code> | 📀 <b>Size:</b> <code>{humanize.naturalsize(torrent.total_size)}</code>\n"\
+        info += f"╭🗂 <b>Name:</b> <code>{torrent.name}</code>\n├🚦 <b>Status:</b> <code>{torrent.state_enum.value}</code> | 📀 <b>Size:</b> <code>{humanize.naturalsize(torrent.total_size)}</code>\n├<code>{get_progress_bar(torrent.downloaded, torrent.total_size)}</code>\n"\
             f"├📥 <b>Downloaded:</b> <code>{humanize.naturalsize(torrent.downloaded)} ({round(number=torrent.progress * 100, ndigits=2)}%)</code>\n├📦 <b>Remaining: </b><code>{humanize.naturalsize(torrent.amount_left)}</code> "\
             f"| 🧩 <b>Peers:</b> <code>{torrent.num_leechs}</code>\n├⚡ <b>Speed:</b> <code>{humanize.naturalsize(torrent.dlspeed)}/s</code> | 🥑 <b>Seeders:</b> <code>{torrent.num_seeds}</code>\n"\
             f"├⏳ <b>ETA:</b> <code>{humanize.naturaldelta(torrent.eta)}</code> "
@@ -1565,6 +1576,7 @@ async def action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             _ids = list(TASK_ID_DICT.values())
             if _task_id not in _ids:
                 await reply_message("❗<b>Unable to find any task with the given ID</b>", update, context)
+                return
             else:
                 input_act = _action[0].lstrip('#')
                 if input_act == "pause":
