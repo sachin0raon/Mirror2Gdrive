@@ -877,14 +877,21 @@ async def edit_message(msg: str, callback: CallbackQuery, keyboard: InlineKeyboa
 
 async def get_total_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     file_btns = []
+    files_ = []
     msg = ''
     keyboard = None
-    for down in aria2c.get_downloads():
-        file_btns.append([InlineKeyboardButton(text=f"[{down.status}] {down.name}", callback_data=f"aria-file#{down.gid}")])
+    files_.extend([down for down in aria2c.get_downloads()])
     if qb_client := get_qbit_client():
-        for torrent in qb_client.torrents_info():
-            file_btns.append([InlineKeyboardButton(text=f"[{torrent.state_enum.value}] {torrent.name}", callback_data=f"qbit-file#{torrent.hash}")])
+        files_.extend([torrent for torrent in qb_client.torrents_info()])
         qb_client.auth_log_out()
+    for file_ in natsorted(seq=files_, key=lambda x: x.name if isinstance(x, aria2p.Download) else x.get('name')):
+        if isinstance(file_, qbittorrentapi.TorrentDictionary):
+            text = f"[{file_.state_enum.value}] {file_.get('name')}"
+            cb_data = f"qbit-file#{file_.get('hash')}"
+        else:
+            text = f"[{file_.status}] {file_.name}"
+            cb_data = f"aria-file#{file_.gid}"
+        file_btns.append([InlineKeyboardButton(text=text, callback_data=cb_data)])
     if file_btns:
         msg += f"🗂️ <b>Downloads ({len(file_btns)})</b>"
         keyboard = InlineKeyboardMarkup(file_btns)
