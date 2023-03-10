@@ -823,9 +823,22 @@ async def get_buttons(prog: str, dl_info: str) -> Dict[str, InlineKeyboardButton
         "resume": InlineKeyboardButton(text="▶ Resume", callback_data=f"{prog}-resume#{dl_info}"),
         "pause": InlineKeyboardButton(text="⏸ Pause", callback_data=f"{prog}-pause#{dl_info}"),
         "upload": InlineKeyboardButton(text="☁️ Upload", callback_data=f"{prog}-upload#{dl_info}"),
+        "leech": InlineKeyboardButton(text="🌀 Leech", callback_data=f"{prog}-leech#{dl_info}"),
         "extract": InlineKeyboardButton(text="🗃️ Extract", callback_data=f"{prog}-extract#{dl_info}"),
         "show_all": InlineKeyboardButton(text=f"🔆 Show All ({await get_downloads_count()})", callback_data=f"{prog}-lists")
     }
+
+async def get_comp_action_btns(file_name: str, buttons: Dict[str, InlineKeyboardButton]):
+    if ngrok_btn := await get_ngrok_btn(file_name):
+        if is_archive_file(file_name):
+            action_btn = [[ngrok_btn, buttons["extract"]], [buttons["upload"], buttons["leech"]], [buttons["show_all"], buttons["delete"]]]
+        else:
+            action_btn = [[ngrok_btn, buttons["upload"]], [buttons["leech"], buttons["delete"]], [buttons["show_all"]]]
+    elif is_archive_file(file_name):
+        action_btn = [[buttons["extract"], buttons["upload"]], [buttons["leech"], buttons["delete"]], [buttons["show_all"]]]
+    else:
+        action_btn = [[buttons["upload"], buttons["leech"]], [buttons["show_all"], buttons["delete"]]]
+    return action_btn
 
 async def get_aria_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
     buttons = await get_buttons("aria", down.gid)
@@ -837,15 +850,7 @@ async def get_aria_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
     elif "active" == down.status:
         action_btn.insert(0, [buttons["refresh"], buttons["pause"]])
     elif "complete" == down.status and down.is_metadata is False and not down.followed_by_ids:
-        if ngrok_btn := await get_ngrok_btn(down.name):
-            if is_archive_file(down.name):
-                action_btn = [[ngrok_btn, buttons["extract"]], [buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
-            else:
-                action_btn = [[ngrok_btn, buttons["upload"]], [buttons["show_all"], buttons["delete"]]]
-        elif is_archive_file(down.name):
-            action_btn = [[buttons["extract"], buttons["upload"]], [buttons["show_all"], buttons["delete"]]]
-        else:
-            action_btn = [[buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
+        action_btn = await get_comp_action_btns(down.name, buttons)
     else:
         action_btn = [[buttons["refresh"], buttons["delete"]], [buttons["show_all"]]]
     return InlineKeyboardMarkup(action_btn)
@@ -861,15 +866,7 @@ async def get_qbit_keyboard(qbit: qbittorrentapi.TorrentDictionary = None) -> In
     elif qbit.state_enum.is_downloading:
         action_btn.insert(0, [buttons["refresh"], buttons["pause"]])
     elif qbit.state_enum.is_complete or "pausedUP" == qbit.state_enum.value:
-        if ngrok_btn := await get_ngrok_btn(file_name):
-            if is_archive_file(file_name):
-                action_btn = [[ngrok_btn, buttons["extract"]], [buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
-            else:
-                action_btn.insert(0, [ngrok_btn, buttons["upload"]])
-        elif is_archive_file(file_name):
-            action_btn.insert(0, [buttons["extract"], buttons["upload"]])
-        else:
-            action_btn = [[buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
+        action_btn = await get_comp_action_btns(file_name, buttons)
     else:
         action_btn = [[buttons["refresh"], buttons["delete"]], [buttons["show_all"]]]
     return InlineKeyboardMarkup(action_btn)
@@ -957,25 +954,37 @@ def get_sys_info() -> str:
         pass
     return details
 
-async def trigger_upload(name: str, prog: str, file_id: str, update: Update, origin: bool = True) -> None:
+async def get_event_loop(name: str, file_id: str, prog: str, callback: CallbackQuery, leech: bool = False) -> Optional[asyncio.events.AbstractEventLoop]:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        logger.critical(f"[RuntimeError] Failed to obtain event loop, unable to process: {name}")
+        msg = f"⁉️<b>Failed to initiate {'leech' if leech else 'upload'} process for: </b><code>{name}</code>\n⚠️ <i>Please tap on the back button and retry</i>"
+        return await edit_message(msg, callback, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
+
+async def trigger_upload(name: str, prog: str, file_id: str, update: Update, origin: bool = True, leech: bool = False) -> None:
+    loop = await get_event_loop(name, file_id, prog, update.callback_query, leech)
+    if not loop:
+        return
     if not origin and is_archive_file(name):
         msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is an archive</b> so do you want to upload as it is or upload the extracted contents❓"
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup(
-            [[InlineKeyboardButton(text="📦 Original", callback_data=f"{prog}-upload-orig#{file_id}"),
-              InlineKeyboardButton(text="🗃 Extracted", callback_data=f"{prog}-upext#{file_id}")],
+            [[InlineKeyboardButton(text="📦 Original", callback_data=f"{prog}-{'leech' if leech else 'upload'}-orig#{file_id}"),
+              InlineKeyboardButton(text="🗃 Extracted", callback_data=f"{prog}-{'leext' if leech else 'upext'}#{file_id}")],
              [InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]
         ))
+    elif leech:
+        msg = f"📤 <b>Leeching started for: </b><code>{name}</code>\n⚠️ <i>Do not press the leech button again unless it has failed, you'll receive status updates on the same</i>"
+        asyncio.run_coroutine_threadsafe(trigger_tg_upload(down_path=f"{DOWNLOAD_PATH}/{name}", task_id=file_id), loop)
+        logger.info(f"Leech thread started for: {name}")
+        await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
     elif await count_uploaded_files(file_name=name) > 0:
         msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already uploaded</b> and can be found in {GDRIVE_FOLDER_BASE_URL.format(GDRIVE_FOLDER_ID)}"
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
     else:
         msg = f"🌈 <b>Upload started for: </b><code>{name}</code>\n⚠️ <i>Do not press the upload button again unless the upload has failed, you'll receive status updates on the same</i>"
-        try:
-            asyncio.run_coroutine_threadsafe(upload_to_gdrive(name=name, chat_id=str(update.callback_query.message.chat_id)), asyncio.get_running_loop())
-            logger.info(f"Upload thread started for: {name}")
-        except RuntimeError:
-            logger.info(f"Failed to start upload thread for: {name}")
-            msg = f"⁉️<b>Failed to initiate upload for: </b><code>{name}</code>\n⚠️ <i>Please tap on the back button and retry</i>"
+        asyncio.run_coroutine_threadsafe(upload_to_gdrive(name=name, chat_id=str(update.callback_query.message.chat_id)), loop)
+        logger.info(f"Upload thread started for: {name}")
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
 
 def is_file_extracted(file_name: str) -> bool:
@@ -988,7 +997,7 @@ def is_file_extracted(file_name: str) -> bool:
     except OSError:
         return False
 
-async def start_extraction(name: str, prog: str, file_id: str, update: Update, upload: bool = False) -> None:
+async def start_extraction(name: str, prog: str, file_id: str, update: Update, upload: bool = False, leech: bool = False) -> None:
     folder_name = os.path.splitext(name)[0]
     if is_file_extracted(name):
         msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already extracted</b>{await get_ngrok_file_url(folder_name)}"
@@ -1002,21 +1011,22 @@ async def start_extraction(name: str, prog: str, file_id: str, update: Update, u
         try:
             await asyncio.to_thread(patoolib.extract_archive, archive=f"{DOWNLOAD_PATH}/{name}", outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
             msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️{await get_ngrok_file_url(folder_name)}"
-            send_status_update(msg)
-            if upload is True:
-                try:
-                    asyncio.run_coroutine_threadsafe(upload_to_gdrive(name=folder_name, chat_id=str(update.callback_query.message.chat_id)), asyncio.get_running_loop())
-                except RuntimeError:
-                    logger.info(f"Failed to start upload thread for: {folder_name}")
+            await send_msg_async(msg, update.callback_query.message.chat_id)
+            if loop := await get_event_loop(name, file_id, prog, update.callback_query, leech):
+                if upload:
+                    asyncio.run_coroutine_threadsafe(upload_to_gdrive(name=folder_name, chat_id=str(update.callback_query.message.chat_id)), loop)
+                elif leech:
+                    asyncio.run_coroutine_threadsafe(trigger_tg_upload(down_path=f"{DOWNLOAD_PATH}/{folder_name}", task_id=file_id), loop)
         except patoolib.util.PatoolError as err:
             shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
-            send_status_update(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n<i>Check /{LOG_CMD} for more details.</i>")
+            await send_msg_async(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n"
+                                 f"<i>Check /{LOG_CMD} for more details.</i>", update.callback_query.message.chat_id)
 
-async def upext_handler(file_name: str, prog: str, file_id: str, update: Update) -> None:
+async def upext_handler(file_name: str, prog: str, file_id: str, update: Update, leech: bool = False) -> None:
     if is_file_extracted(file_name):
-        await trigger_upload(os.path.splitext(file_name)[0], prog, file_id, update)
+        await trigger_upload(os.path.splitext(file_name)[0], prog, file_id, update, leech=leech)
     else:
-        await start_extraction(file_name, prog, file_id, update, True)
+        await start_extraction(file_name, prog, file_id, update, upload=False if leech else True, leech=True if leech else False)
 
 async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -1048,6 +1058,10 @@ async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 await start_extraction(aria_obj.name, "aria", callback_data[1], update)
             elif "upext" in action:
                 await upext_handler(aria_obj.name, "aria", callback_data[1], update)
+            elif "leech" in action:
+                await trigger_upload(name=aria_obj.name, prog="aria", file_id=aria_obj.gid, update=update, leech=True, origin=True if "orig" in action else False)
+            elif "leext" in action:
+                await upext_handler(file_name=aria_obj.name, prog="aria", file_id=aria_obj.gid, update=update, leech=True)
         elif "qbit" in action:
             torrent_hash = callback_data[1].strip() if len(callback_data) > 1 else None
             if qb_client := get_qbit_client():
@@ -1079,6 +1093,10 @@ async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     await start_extraction(name, "qbit", torrent_hash, update)
                 elif "upext" in action:
                     await upext_handler(name, "qbit", torrent_hash, update)
+                elif "leech" in action:
+                    await trigger_upload(name=name, prog="qbit", file_id=torrent_hash, update=update, leech=True, origin=True if "orig" in action else False)
+                elif "leext" in action:
+                    await upext_handler(file_name=name, prog="qbit", file_id=torrent_hash, update=update, leech=True)
                 qb_client.auth_log_out()
         else:
             if "refresh" == callback_data[1]:
