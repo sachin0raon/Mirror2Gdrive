@@ -1158,8 +1158,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update, context
     )
 
-async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE,
-                      loop: asyncio.events.AbstractEventLoop) -> Tuple[Optional[str], Optional[Message]]:
+async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[Optional[str], Optional[Message]]:
     logger.info(f"Fetching file: {doc.file_name}")
     tg_msg: Optional[Message] = None
     tg_file_path: Optional[str] = None
@@ -1235,6 +1234,7 @@ async def edit_or_reply(msg: Optional[Message], text: str, update: Update, conte
         await context.bot.edit_message_text(text=text, chat_id=msg.chat_id, message_id=msg.message_id, parse_mode=constants.ParseMode.HTML)
     else:
         await reply_message(text, update, context)
+        await delete_download_status()
 
 def download_gdrive_file(file_id: str, file_path: str, gdrive_service, down_prog: UpDownProgressUpdate, chat_id: str) -> None:
     fh = FileIO(file=file_path, mode='wb')
@@ -1399,17 +1399,17 @@ async def gdrive_handler(link: str, upload_mode: str, update: Update, context: C
     else:
         await edit_or_reply(None, "❗<b>Failed to get the GDrive ID from given link.</b> Please validate the link and retry", update, context)
 
-async def reply_handler(reply_doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE, upload_mode: str,
-                        loop: asyncio.events.AbstractEventLoop) -> None:
-    tg_file_path, tg_msg = await get_tg_file(reply_doc, update, context, loop)
+async def reply_handler(reply_doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE, upload_mode: str) -> None:
+    tg_file_path, tg_msg = await get_tg_file(reply_doc, update, context)
     if tg_file_path is None:
         await edit_or_reply(tg_msg, f"❗<b>Failed to download file, please check /{LOG_CMD} for more details</b>", update, context)
     elif magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent":
         logger.info(f"Adding file to download: {reply_doc.file_name}")
         try:
             aria_obj = aria2c.add_torrent(torrent_file_path=tg_file_path)
-            TASK_UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
-            TASK_CHAT_DICT[aria_obj.gid] = update.message.chat_id
+            async with LOCK:
+                TASK_UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
+                TASK_CHAT_DICT[aria_obj.gid] = update.message.chat_id
             if aria_obj.has_failed is False:
                 _msg = f"📥 <b>Download started</b> ✔"
             else:
@@ -1421,7 +1421,8 @@ async def reply_handler(reply_doc: Document, update: Update, context: ContextTyp
         file_path = f"{DOWNLOAD_PATH}/{reply_doc.file_name}"
         shutil.move(src=tg_file_path, dst=file_path)
         up_args = get_up_args(upload_mode, file_path, reply_doc.file_id, update.message.chat_id)
-        TASK_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
+        async with LOCK:
+            TASK_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
         if not any([up_args['extract'], up_args['upload'], up_args['leech']]):
             await edit_or_reply(tg_msg, f"<b>File: </b><code>{reply_doc.file_name}</code> <b>is saved, use ngrok url to "
                                         f"access</b>{await get_ngrok_file_url(reply_doc.file_name)}", update, context)
@@ -1460,13 +1461,8 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
         upload_mode = await get_upload_mode(cmd_txt, unzip, leech)
         if reply_msg := update.message.reply_to_message:
             if reply_doc := reply_msg.document:
-                try:
-                    _loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    logger.error(f"Failed to get running loop for processing of: {reply_doc.file_name}")
-                    await reply_message(f"⁉️<b>File: </b><code>{reply_doc.file_name}</code> <b>failed to initiate process, please retry</b>", update, context)
-                else:
-                    asyncio.run_coroutine_threadsafe(reply_handler(reply_doc, update, context, upload_mode, _loop), _loop)
+                asyncio.run_coroutine_threadsafe(reply_handler(reply_doc, update, context, upload_mode), asyncio.get_running_loop())
+                return
             elif reply_text := reply_msg.text:
                 link = reply_text
             else:
@@ -1496,9 +1492,10 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
         if aria_obj is not None:
             if aria_obj.has_failed is False:
                 logger.info(f"Download started: {aria_obj.name} with GID: {aria_obj.gid}")
-                TASK_UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
-                TASK_CHAT_DICT[aria_obj.gid] = update.message.chat_id
-                TASK_ID_DICT[aria_obj.gid] = ''.join(choice(ascii_letters) for i in range(8))
+                async with LOCK:
+                    TASK_UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
+                    TASK_CHAT_DICT[aria_obj.gid] = update.message.chat_id
+                    TASK_ID_DICT[aria_obj.gid] = ''.join(choice(ascii_letters) for i in range(8))
                 await reply_message(f"📥 <b>Download started</b> ✔", update, context)
                 await delete_download_status()
             else:
@@ -1545,10 +1542,12 @@ async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
                 await reply_message(f"🧲 <b>Torrent added</b> ✔", update, context)
                 await delete_download_status()
                 for torrent in qb_client.torrents_info(status_filter='all', sort='added_on', reverse=True, limit=1):
-                    TASK_UPLOAD_MODE_DICT[torrent.get('hash')] = upload_mode
-                    TASK_CHAT_DICT[torrent.get('hash')] = update.message.chat_id
-                    TASK_STATUS_MSG_DICT[torrent.get('hash')] = "NOT_SENT"
-                    TASK_ID_DICT[torrent.get('hash')] = ''.join(choice(ascii_letters) for i in range(8))
+                    async with LOCK:
+                        if not torrent.get('hash') in TASK_CHAT_DICT:
+                            TASK_UPLOAD_MODE_DICT[torrent.get('hash')] = upload_mode
+                            TASK_CHAT_DICT[torrent.get('hash')] = update.message.chat_id
+                            TASK_STATUS_MSG_DICT[torrent.get('hash')] = "NOT_SENT"
+                            TASK_ID_DICT[torrent.get('hash')] = ''.join(choice(ascii_letters) for i in range(8))
             else:
                 await reply_message("❗ <b>Failed to add it</b>\n⚠️ <i>Kindly verify the given link and retry</i>", update, context)
         except IndexError:
@@ -1774,6 +1773,7 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 send_status_update(msg)
                                 TASK_STATUS_MSG_DICT[torrent.get('hash')] = "SENT"
                                 asyncio.run_coroutine_threadsafe(coro=trigger_extract_upload(torrent, torrent.get('hash')), loop=asyncio.get_running_loop())
+                                await delete_download_status()
                     elif torrent.state_enum.is_errored:
                         dl_report += f"{await get_qbit_info(torrent.get('hash'), qb_client)}{await get_action_str(torrent)}\n"
                         if present_in_dict:
@@ -1795,6 +1795,7 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 send_status_update(msg)
                                 TASK_STATUS_MSG_DICT[down.gid] = "SENT"
                                 asyncio.run_coroutine_threadsafe(coro=trigger_extract_upload(down, down.gid), loop=asyncio.get_running_loop())
+                                await delete_download_status()
                         else:
                             for fgid in down.followed_by_ids:
                                 TASK_UPLOAD_MODE_DICT[fgid] = TASK_UPLOAD_MODE_DICT.get(down.gid) if down.gid in TASK_UPLOAD_MODE_DICT else "M"
