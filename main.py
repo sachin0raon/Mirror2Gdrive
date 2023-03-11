@@ -124,10 +124,8 @@ def get_qbit_client() -> Optional[qbittorrentapi.Client]:
             REQUESTS_ARGS={'timeout': (30, 60)},
             DISABLE_LOGGING_DEBUG_OUTPUT=True
         )
-    except (qbittorrentapi.exceptions.APIConnectionError,
-            qbittorrentapi.exceptions.LoginFailed,
-            qbittorrentapi.exceptions.Forbidden403Error) as err:
-        logger.error(f"Failed to initialize client: {str(err)}")
+    except Exception as err:
+        logger.error(f"Failed to initialize qbit client: {err.__class__.__name__}")
         return None
 
 async def send_msg_async(msg: str, user_id: Union[str, int]) -> int:
@@ -1830,7 +1828,7 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await delete_download_status()
             qb_client.auth_log_out()
         except (qbittorrentapi.APIConnectionError, aria2p.ClientException, RuntimeError) as err:
-            logger.warning(f"Error in aria qbit listener [{str(err)}]")
+            logger.warning(f"Error in aria qbit listener [{err.__class__.__name__}]")
         except errors.RPCError as err:
             logger.debug(f"Failed to update download status [{err.ID}]")
 
