@@ -70,6 +70,7 @@ TASK_UPLOAD_MODE_DICT = dict()
 TASK_CHAT_DICT = dict()
 TASK_ID_DICT = dict()
 CHAT_UPDATE_MSG_DICT = dict()
+UPDOWN_LIST = list()
 FOUR_GB = 4194304000
 TWO_GB = 2097152000
 PICKLE_FILE_NAME = "token.pickle"
@@ -123,10 +124,8 @@ def get_qbit_client() -> Optional[qbittorrentapi.Client]:
             REQUESTS_ARGS={'timeout': (30, 60)},
             DISABLE_LOGGING_DEBUG_OUTPUT=True
         )
-    except (qbittorrentapi.exceptions.APIConnectionError,
-            qbittorrentapi.exceptions.LoginFailed,
-            qbittorrentapi.exceptions.Forbidden403Error) as err:
-        logger.error(f"Failed to initialize client: {str(err)}")
+    except Exception as err:
+        logger.error(f"Failed to initialize qbit client: {err.__class__.__name__}")
         return None
 
 async def send_msg_async(msg: str, user_id: Union[str, int]) -> int:
@@ -323,36 +322,24 @@ async def delete_download_status() -> None:
             CHAT_UPDATE_MSG_DICT.pop(_chat_id)
 
 class UpDownProgressUpdate:
-    def __init__(self, name: str = None, up_start_time: float = 0.0, current: int = 0, total: int = 0,
-                 user_id: str = None, stat_msg_id: Optional[int] = None, delay: int = 5, action: str = "📤 <b>Uploading</b>"):
+    def __init__(self, name: str = None, up_start_time: float = 0.0, current: int = 0, total: int = 0, user_id: str = None, action: str = "📤 <b>Uploading</b>"):
         self.file_name = name
         self.up_start_time = up_start_time
         self.uploaded_bytes = current
         self.total_bytes = total
         self.user_id = user_id
-        self.stat_msg_id = stat_msg_id
-        self.delay = delay
         self.action = action
+        self.status = "IN_PROGRESS"
 
     async def set_processed_bytes(self, current: int = 0, total: int = 0) -> None:
         self.uploaded_bytes = current
 
-    async def send_status_update(self) -> None:
+    async def get_status_msg(self) -> str:
         if self.uploaded_bytes > self.total_bytes:
             self.uploaded_bytes = self.total_bytes
-        try:
-            await pyro_app.edit_message_text(
-                  chat_id=self.user_id, message_id=self.stat_msg_id,
-                  text=f"╭{self.action}\n├🗂️ <b>File: </b><code>{self.file_name}</code>\n├📀 <b>Size: </b><code>{humanize.naturalsize(self.total_bytes)}</code>\n├<code>{get_progress_bar(self.uploaded_bytes, self.total_bytes)}</code>\n"
-                       f"├💾 <b>Processed: </b><code>{humanize.naturalsize(self.uploaded_bytes)} [{round(number=self.uploaded_bytes * 100 / self.total_bytes, ndigits=1)}%]</code>\n"
-                       f"╰⚡ <b>Speed: </b><code>{humanize.naturalsize(self.uploaded_bytes / (time.time() - self.up_start_time))}/s</code>")
-        except errors.RPCError as err:
-            logger.debug(f"Failed to update status for {self.file_name} [{err.ID}]")
-
-    async def trigger_update(self) -> None:
-        while self.uploaded_bytes < self.total_bytes and self.stat_msg_id is not None:
-            await asyncio.sleep(self.delay)
-            await self.send_status_update()
+        return f"╭{self.action}\n├🗂️ <b>File: </b><code>{self.file_name}</code>\n├📀 <b>Size: </b><code>{humanize.naturalsize(self.total_bytes)}</code>\n" \
+               f"├<code>{get_progress_bar(self.uploaded_bytes, self.total_bytes)}</code>\n├💾 <b>Processed: </b><code>{humanize.naturalsize(self.uploaded_bytes)} " \
+               f"[{round(number=self.uploaded_bytes * 100 / self.total_bytes, ndigits=1)}%]</code>\n╰⚡ <b>Speed: </b><code>{humanize.naturalsize(self.uploaded_bytes / (time.time() - self.up_start_time))}/s</code>"
 
 def upload_file(file_path: str, folder_id: str, creds, task_data: str = None, from_dir: bool = False,
                 up_prog: UpDownProgressUpdate = None) -> None:
@@ -426,7 +413,6 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
     is_dir = False
     file_name = None
     task_done = False
-    _msg_id = 0
     file_path = None
     task_id: Optional[str] = None
     try:
@@ -454,7 +440,6 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
             return
         else:
             if creds := get_oauth_creds():
-                _msg_id = await send_msg_async(f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{file_name}</code>", chat_id)
                 _size = 0
                 if os.path.isfile(file_path):
                     _size = os.stat(file_path).st_size
@@ -462,12 +447,9 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
                     for path, _, files in os.walk(file_path):
                         for f in files:
                             _size += os.stat(os.path.join(path, f)).st_size
-                up_prog = UpDownProgressUpdate(name=file_name, up_start_time=time.time(), total=_size, user_id=chat_id,
-                                               stat_msg_id=_msg_id)
-                try:
-                    asyncio.run_coroutine_threadsafe(coro=up_prog.trigger_update(), loop=asyncio.get_running_loop())
-                except RuntimeError:
-                    logger.warning("Failed to start upload status task")
+                up_prog = UpDownProgressUpdate(name=file_name, up_start_time=time.time(), total=_size, user_id=chat_id, action="📤 <b>Uploading [GDrive]</b>")
+                async with LOCK:
+                    UPDOWN_LIST.append(up_prog)
                 if os.path.isdir(file_path) is True:
                     is_dir = True
                     if folder_id := create_folder(os.path.basename(file_path), creds):
@@ -477,7 +459,7 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
                                 await asyncio.to_thread(upload_file, os.path.join(path, f), folder_id, creds, None, True, up_prog)
                 else:
                     await asyncio.to_thread(upload_file, file_path, GDRIVE_FOLDER_ID, creds, task_id, False, up_prog)
-                up_prog.stat_msg_id = None
+                up_prog.status = "COMPLETE"
     except (aria2p.ClientException, OSError, AttributeError):
         logger.error("Failed to complete download event task")
     except qbittorrentapi.exceptions.NotFound404Error:
@@ -493,7 +475,6 @@ async def upload_to_gdrive(gid: str = None, hash: str = None, name: str = None, 
         else:
             await delete_empty_folder(folder_id, creds)
             send_status_update(f"🗂️ <b>Folder: </b><code>{file_name}</code> upload <b>failed</b>❗\n⚠️ <i>Please check the log for more details using</i> <code>/{LOG_CMD}</code>")
-    await delete_msg(_msg_id, chat_id)
     await delete_download_status()
     return task_done
 
@@ -524,25 +505,20 @@ async def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[t
         return
     stat_msg_id = None
     _file_size = 0
-    upload_progress = UpDownProgressUpdate()
-    if user_id is not None:
-        if media_list is None:
-            _file_size = os.stat(file_path).st_size
-            msg_txt = f"📤 <b>Uploading</b>\n🗂️ <b>File: </b><code>{file_name}</code>\n📀 <b>Size: </b><code>{humanize.naturalsize(_file_size)}</code>"
-        else:
-            msg_txt = f"📤 <b>Upload started [media group]</b>\n🗂️ <b>Folder: </b><code>{file_name}</code>\n📀 <b>Total Size: </b><code>"
-            for media_file in media_list:
-                _file_size += os.stat(media_file.media).st_size
-            msg_txt += f"{humanize.naturalsize(_file_size)}</code>\n📚 <b>Total Files: </b><code>{len(media_list)}</code>"
-        stat_msg_id = await send_msg_async(msg_txt, user_id)
-        upload_progress = UpDownProgressUpdate(file_name, time.time(), 0, _file_size, user_id, stat_msg_id)
+    if media_list is None:
+        _file_size = os.stat(file_path).st_size
+    else:
+        msg_txt = f"📤 <b>Upload started [media group]</b>\n🗂️ <b>Folder: </b><code>{file_name}</code>\n📀 <b>Total Size: </b><code>"
+        for media_file in media_list:
+            _file_size += os.stat(media_file.media).st_size
+        msg_txt += f"{humanize.naturalsize(_file_size)}</code>\n📚 <b>Total Files: </b><code>{len(media_list)}</code>"
+        if user_id is not None:
+            stat_msg_id = await send_msg_async(msg_txt, user_id)
+    upload_progress = UpDownProgressUpdate(name=file_name, up_start_time=time.time(), current=0, total=_file_size, user_id=user_id, action="🌀 <b>Leeching</b>")
+    async with LOCK:
+        UPDOWN_LIST.append(upload_progress)
     user_id = "self" if user_id is None else user_id
     logger.info(f"Tg Upload started: {file_name} [Total items: {len(media_list)}]") if media_list else logger.info(f"Tg Upload started: {file_name}")
-    try:
-        if media_list is None:
-            asyncio.run_coroutine_threadsafe(coro=upload_progress.trigger_update(), loop=asyncio.get_running_loop())
-    except RuntimeError:
-        logger.warning("Failed to start upload status task")
     LOG_CHANNEL = int(os.getenv('LOG_CHANNEL', '0'))
     BOT_PM = os.getenv('BOT_PM', 'True').lower() == "true"
     try:
@@ -613,7 +589,7 @@ async def upload_to_tg(file_id: str, file_path: str, media_list: Optional[List[t
         logger.error(f"Tg Upload failed: {file_name} [{err.ID}]")
         raise err
     finally:
-        upload_progress.stat_msg_id = None
+        upload_progress.status = "COMPLETE"
         await delete_msg(msg_id=stat_msg_id, chat_id=user_id)
 
 async def get_file_thumb(file_path: str) -> Optional[str]:
@@ -823,9 +799,22 @@ async def get_buttons(prog: str, dl_info: str) -> Dict[str, InlineKeyboardButton
         "resume": InlineKeyboardButton(text="▶ Resume", callback_data=f"{prog}-resume#{dl_info}"),
         "pause": InlineKeyboardButton(text="⏸ Pause", callback_data=f"{prog}-pause#{dl_info}"),
         "upload": InlineKeyboardButton(text="☁️ Upload", callback_data=f"{prog}-upload#{dl_info}"),
+        "leech": InlineKeyboardButton(text="🌀 Leech", callback_data=f"{prog}-leech#{dl_info}"),
         "extract": InlineKeyboardButton(text="🗃️ Extract", callback_data=f"{prog}-extract#{dl_info}"),
         "show_all": InlineKeyboardButton(text=f"🔆 Show All ({await get_downloads_count()})", callback_data=f"{prog}-lists")
     }
+
+async def get_comp_action_btns(file_name: str, buttons: Dict[str, InlineKeyboardButton]):
+    if ngrok_btn := await get_ngrok_btn(file_name):
+        if is_archive_file(file_name):
+            action_btn = [[ngrok_btn, buttons["extract"]], [buttons["upload"], buttons["leech"]], [buttons["show_all"], buttons["delete"]]]
+        else:
+            action_btn = [[ngrok_btn, buttons["upload"]], [buttons["leech"], buttons["delete"]], [buttons["show_all"]]]
+    elif is_archive_file(file_name):
+        action_btn = [[buttons["extract"], buttons["upload"]], [buttons["leech"], buttons["delete"]], [buttons["show_all"]]]
+    else:
+        action_btn = [[buttons["upload"], buttons["leech"]], [buttons["show_all"], buttons["delete"]]]
+    return action_btn
 
 async def get_aria_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
     buttons = await get_buttons("aria", down.gid)
@@ -837,15 +826,7 @@ async def get_aria_keyboard(down: aria2p.Download) -> InlineKeyboardMarkup:
     elif "active" == down.status:
         action_btn.insert(0, [buttons["refresh"], buttons["pause"]])
     elif "complete" == down.status and down.is_metadata is False and not down.followed_by_ids:
-        if ngrok_btn := await get_ngrok_btn(down.name):
-            if is_archive_file(down.name):
-                action_btn = [[ngrok_btn, buttons["extract"]], [buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
-            else:
-                action_btn = [[ngrok_btn, buttons["upload"]], [buttons["show_all"], buttons["delete"]]]
-        elif is_archive_file(down.name):
-            action_btn = [[buttons["extract"], buttons["upload"]], [buttons["show_all"], buttons["delete"]]]
-        else:
-            action_btn = [[buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
+        action_btn = await get_comp_action_btns(down.name, buttons)
     else:
         action_btn = [[buttons["refresh"], buttons["delete"]], [buttons["show_all"]]]
     return InlineKeyboardMarkup(action_btn)
@@ -861,15 +842,7 @@ async def get_qbit_keyboard(qbit: qbittorrentapi.TorrentDictionary = None) -> In
     elif qbit.state_enum.is_downloading:
         action_btn.insert(0, [buttons["refresh"], buttons["pause"]])
     elif qbit.state_enum.is_complete or "pausedUP" == qbit.state_enum.value:
-        if ngrok_btn := await get_ngrok_btn(file_name):
-            if is_archive_file(file_name):
-                action_btn = [[ngrok_btn, buttons["extract"]], [buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
-            else:
-                action_btn.insert(0, [ngrok_btn, buttons["upload"]])
-        elif is_archive_file(file_name):
-            action_btn.insert(0, [buttons["extract"], buttons["upload"]])
-        else:
-            action_btn = [[buttons["upload"], buttons["delete"]], [buttons["show_all"]]]
+        action_btn = await get_comp_action_btns(file_name, buttons)
     else:
         action_btn = [[buttons["refresh"], buttons["delete"]], [buttons["show_all"]]]
     return InlineKeyboardMarkup(action_btn)
@@ -902,14 +875,21 @@ async def edit_message(msg: str, callback: CallbackQuery, keyboard: InlineKeyboa
 
 async def get_total_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     file_btns = []
+    files_ = []
     msg = ''
     keyboard = None
-    for down in aria2c.get_downloads():
-        file_btns.append([InlineKeyboardButton(text=f"[{down.status}] {down.name}", callback_data=f"aria-file#{down.gid}")])
+    files_.extend([down for down in aria2c.get_downloads()])
     if qb_client := get_qbit_client():
-        for torrent in qb_client.torrents_info():
-            file_btns.append([InlineKeyboardButton(text=f"[{torrent.state_enum.value}] {torrent.name}", callback_data=f"qbit-file#{torrent.hash}")])
+        files_.extend([torrent for torrent in qb_client.torrents_info()])
         qb_client.auth_log_out()
+    for file_ in natsorted(seq=files_, key=lambda x: x.name if isinstance(x, aria2p.Download) else x.get('name')):
+        if isinstance(file_, qbittorrentapi.TorrentDictionary):
+            text = f"[{file_.state_enum.value}] {file_.get('name')}"
+            cb_data = f"qbit-file#{file_.get('hash')}"
+        else:
+            text = f"[{file_.status}] {file_.name}"
+            cb_data = f"aria-file#{file_.gid}"
+        file_btns.append([InlineKeyboardButton(text=text, callback_data=cb_data)])
     if file_btns:
         msg += f"🗂️ <b>Downloads ({len(file_btns)})</b>"
         keyboard = InlineKeyboardMarkup(file_btns)
@@ -957,25 +937,37 @@ def get_sys_info() -> str:
         pass
     return details
 
-async def trigger_upload(name: str, prog: str, file_id: str, update: Update, origin: bool = True) -> None:
+async def get_event_loop(name: str, file_id: str, prog: str, callback: CallbackQuery, leech: bool = False) -> Optional[asyncio.events.AbstractEventLoop]:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        logger.critical(f"[RuntimeError] Failed to obtain event loop, unable to process: {name}")
+        msg = f"⁉️<b>Failed to initiate {'leech' if leech else 'upload'} process for: </b><code>{name}</code>\n⚠️ <i>Please tap on the back button and retry</i>"
+        return await edit_message(msg, callback, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
+
+async def trigger_upload(name: str, prog: str, file_id: str, update: Update, origin: bool = True, leech: bool = False) -> None:
+    loop = await get_event_loop(name, file_id, prog, update.callback_query, leech)
+    if not loop:
+        return
     if not origin and is_archive_file(name):
         msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is an archive</b> so do you want to upload as it is or upload the extracted contents❓"
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup(
-            [[InlineKeyboardButton(text="📦 Original", callback_data=f"{prog}-upload-orig#{file_id}"),
-              InlineKeyboardButton(text="🗃 Extracted", callback_data=f"{prog}-upext#{file_id}")],
+            [[InlineKeyboardButton(text="📦 Original", callback_data=f"{prog}-{'leech' if leech else 'upload'}-orig#{file_id}"),
+              InlineKeyboardButton(text="🗃 Extracted", callback_data=f"{prog}-{'leext' if leech else 'upext'}#{file_id}")],
              [InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]
         ))
+    elif leech:
+        msg = f"📤 <b>Leeching started for: </b><code>{name}</code>\n⚠️ <i>Do not press the leech button again unless it has failed, you'll receive status updates on the same</i>"
+        asyncio.run_coroutine_threadsafe(trigger_tg_upload(down_path=f"{DOWNLOAD_PATH}/{name}", task_id=file_id), loop)
+        logger.info(f"Leech thread started for: {name}")
+        await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
     elif await count_uploaded_files(file_name=name) > 0:
         msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already uploaded</b> and can be found in {GDRIVE_FOLDER_BASE_URL.format(GDRIVE_FOLDER_ID)}"
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
     else:
         msg = f"🌈 <b>Upload started for: </b><code>{name}</code>\n⚠️ <i>Do not press the upload button again unless the upload has failed, you'll receive status updates on the same</i>"
-        try:
-            asyncio.run_coroutine_threadsafe(upload_to_gdrive(name=name, chat_id=str(update.callback_query.message.chat_id)), asyncio.get_running_loop())
-            logger.info(f"Upload thread started for: {name}")
-        except RuntimeError:
-            logger.info(f"Failed to start upload thread for: {name}")
-            msg = f"⁉️<b>Failed to initiate upload for: </b><code>{name}</code>\n⚠️ <i>Please tap on the back button and retry</i>"
+        asyncio.run_coroutine_threadsafe(upload_to_gdrive(name=name, chat_id=str(update.callback_query.message.chat_id)), loop)
+        logger.info(f"Upload thread started for: {name}")
         await edit_message(msg, update.callback_query, InlineKeyboardMarkup([[InlineKeyboardButton(text="⬅️ Back", callback_data=f"{prog}-file#{file_id}")]]))
 
 def is_file_extracted(file_name: str) -> bool:
@@ -988,7 +980,7 @@ def is_file_extracted(file_name: str) -> bool:
     except OSError:
         return False
 
-async def start_extraction(name: str, prog: str, file_id: str, update: Update, upload: bool = False) -> None:
+async def start_extraction(name: str, prog: str, file_id: str, update: Update, upload: bool = False, leech: bool = False) -> None:
     folder_name = os.path.splitext(name)[0]
     if is_file_extracted(name):
         msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>is already extracted</b>{await get_ngrok_file_url(folder_name)}"
@@ -1002,21 +994,22 @@ async def start_extraction(name: str, prog: str, file_id: str, update: Update, u
         try:
             await asyncio.to_thread(patoolib.extract_archive, archive=f"{DOWNLOAD_PATH}/{name}", outdir=f"{DOWNLOAD_PATH}/{folder_name}", interactive=False)
             msg = f"🗂️ <b>File:</b> <code>{name}</code> <b>extracted</b> ✔️{await get_ngrok_file_url(folder_name)}"
-            send_status_update(msg)
-            if upload is True:
-                try:
-                    asyncio.run_coroutine_threadsafe(upload_to_gdrive(name=folder_name, chat_id=str(update.callback_query.message.chat_id)), asyncio.get_running_loop())
-                except RuntimeError:
-                    logger.info(f"Failed to start upload thread for: {folder_name}")
+            await send_msg_async(msg, update.callback_query.message.chat_id)
+            if loop := await get_event_loop(name, file_id, prog, update.callback_query, leech):
+                if upload:
+                    asyncio.run_coroutine_threadsafe(upload_to_gdrive(name=folder_name, chat_id=str(update.callback_query.message.chat_id)), loop)
+                elif leech:
+                    asyncio.run_coroutine_threadsafe(trigger_tg_upload(down_path=f"{DOWNLOAD_PATH}/{folder_name}", task_id=file_id), loop)
         except patoolib.util.PatoolError as err:
             shutil.rmtree(path=f"{DOWNLOAD_PATH}/{folder_name}", ignore_errors=True)
-            send_status_update(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n<i>Check /{LOG_CMD} for more details.</i>")
+            await send_msg_async(f"⁉️ <b>Failed to extract:</b> <code>{name}</code>\n⚠️ <b>Error:</b> <code>{str(err).replace('>', '').replace('<', '')}</code>\n"
+                                 f"<i>Check /{LOG_CMD} for more details.</i>", update.callback_query.message.chat_id)
 
-async def upext_handler(file_name: str, prog: str, file_id: str, update: Update) -> None:
+async def upext_handler(file_name: str, prog: str, file_id: str, update: Update, leech: bool = False) -> None:
     if is_file_extracted(file_name):
-        await trigger_upload(os.path.splitext(file_name)[0], prog, file_id, update)
+        await trigger_upload(os.path.splitext(file_name)[0], prog, file_id, update, leech=leech)
     else:
-        await start_extraction(file_name, prog, file_id, update, True)
+        await start_extraction(file_name, prog, file_id, update, upload=False if leech else True, leech=True if leech else False)
 
 async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -1048,6 +1041,10 @@ async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 await start_extraction(aria_obj.name, "aria", callback_data[1], update)
             elif "upext" in action:
                 await upext_handler(aria_obj.name, "aria", callback_data[1], update)
+            elif "leech" in action:
+                await trigger_upload(name=aria_obj.name, prog="aria", file_id=aria_obj.gid, update=update, leech=True, origin=True if "orig" in action else False)
+            elif "leext" in action:
+                await upext_handler(file_name=aria_obj.name, prog="aria", file_id=aria_obj.gid, update=update, leech=True)
         elif "qbit" in action:
             torrent_hash = callback_data[1].strip() if len(callback_data) > 1 else None
             if qb_client := get_qbit_client():
@@ -1079,6 +1076,10 @@ async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     await start_extraction(name, "qbit", torrent_hash, update)
                 elif "upext" in action:
                     await upext_handler(name, "qbit", torrent_hash, update)
+                elif "leech" in action:
+                    await trigger_upload(name=name, prog="qbit", file_id=torrent_hash, update=update, leech=True, origin=True if "orig" in action else False)
+                elif "leext" in action:
+                    await upext_handler(file_name=name, prog="qbit", file_id=torrent_hash, update=update, leech=True)
                 qb_client.auth_log_out()
         else:
             if "refresh" == callback_data[1]:
@@ -1155,23 +1156,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update, context
     )
 
-async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE,
-                      loop: asyncio.events.AbstractEventLoop) -> Tuple[Optional[str], Optional[Message]]:
+async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[Optional[str], Optional[Message]]:
     logger.info(f"Fetching file: {doc.file_name}")
     tg_msg: Optional[Message] = None
     tg_file_path: Optional[str] = None
     if doc.file_size >= 10485760:
-        tg_msg = await reply_message(f"<b>File: </b><code>{doc.file_name}</code> <b>is being downloaded, please wait</b>", update, context)
+        tg_msg = await reply_message(f"📥 <b>File: </b><code>{doc.file_name}</code> <b>is being downloaded, please wait</b>", update, context)
     try:
         tg_file = await context.bot.get_file(file_id=doc.file_id)
         tg_file_path = await tg_file.download_to_drive(custom_path=f"/tmp/{doc.file_id}")
     except error.TelegramError:
         logger.error(f"Failed to download {doc.file_name}, retrying with pyrogram")
-        down_prog = UpDownProgressUpdate(name=doc.file_name, up_start_time=time.time(), total=doc.file_size, user_id=str(update.message.chat_id),
-                                         stat_msg_id=tg_msg.message_id if tg_msg else None, action="📥 <b>Downloading</b>")
+        down_prog = UpDownProgressUpdate(name=doc.file_name, up_start_time=time.time(), total=doc.file_size, user_id=str(update.message.chat_id), action="📥 <b>Downloading [TG File]</b>")
+        async with LOCK:
+            UPDOWN_LIST.append(down_prog)
         try:
-            asyncio.run_coroutine_threadsafe(down_prog.trigger_update(), loop)
             if pyro_app is not None:
+                await delete_download_status()
                 tg_file_path = await pyro_app.download_media(message=doc.file_id, file_name=f"/tmp/{doc.file_id}",
                                                              progress=down_prog.set_processed_bytes)
             else:
@@ -1185,11 +1186,11 @@ async def get_tg_file(doc: Document, update: Update, context: ContextTypes.DEFAU
                 logger.info(f"Downloaded file from TG: {doc.file_name}")
                 if tg_msg is not None:
                     tg_msg = await context.bot.edit_message_text(
-                        text=f"<b>File: </b><code>{doc.file_name}</code> <b>is downloaded, starting further process</b>",
+                        text=f"🗂️ <b>File: </b><code>{doc.file_name}</code> <b>is downloaded, starting further process</b>",
                         chat_id=tg_msg.chat_id, message_id=tg_msg.message_id, parse_mode=constants.ParseMode.HTML
                     )
         finally:
-            down_prog.stat_msg_id = None
+            down_prog.status = "COMPLETED"
     return tg_file_path, tg_msg
 
 async def extract_upload_tg_file(file_path: str, upload: bool = False, leech: bool = False, task_id: str = "",
@@ -1231,6 +1232,7 @@ async def edit_or_reply(msg: Optional[Message], text: str, update: Update, conte
         await context.bot.edit_message_text(text=text, chat_id=msg.chat_id, message_id=msg.message_id, parse_mode=constants.ParseMode.HTML)
     else:
         await reply_message(text, update, context)
+        await delete_download_status()
 
 def download_gdrive_file(file_id: str, file_path: str, gdrive_service, down_prog: UpDownProgressUpdate, chat_id: str) -> None:
     fh = FileIO(file=file_path, mode='wb')
@@ -1279,10 +1281,10 @@ def get_up_args(upload_mode: str, file_path: str, file_id: str, chat_id: int) ->
 async def gdrive_files_handler(item_id: str, file_list: Dict[str, str], _file_path: str, gdrive_service, file_size: int, tg_msg: Message,
                                update: Update, context: ContextTypes.DEFAULT_TYPE, _loop: asyncio.events.AbstractEventLoop,
                                upload_mode: str, _folder_name: Optional[str] = None):
-    down_prog = UpDownProgressUpdate(user_id=str(update.message.chat_id), total=file_size, stat_msg_id=tg_msg.message_id if tg_msg else None,
-                                     up_start_time=time.time(), action="📥 <b>Downloading</b>")
+    down_prog = UpDownProgressUpdate(user_id=str(update.message.chat_id), total=file_size, up_start_time=time.time(), action="📥 <b>Downloading [GDrive]</b>")
     logger.info(f"Starting status updater for: {item_id}")
-    asyncio.run_coroutine_threadsafe(coro=down_prog.trigger_update(), loop=_loop)
+    async with LOCK:
+        UPDOWN_LIST.append(down_prog)
     for file_id in file_list:
         file_name = file_list[file_id]
         logger.info(f"Starting download: {file_name} [{file_id}]")
@@ -1297,7 +1299,7 @@ async def gdrive_files_handler(item_id: str, file_list: Dict[str, str], _file_pa
             file_path = f"{_file_path}/{_name}_{count}{_ext}"
         down_prog.file_name = os.path.basename(file_path)
         await asyncio.to_thread(download_gdrive_file, file_id, file_path, gdrive_service, down_prog, str(update.message.chat_id))
-    down_prog.stat_msg_id = None
+    down_prog.status = "COMPLETED"
     gdrive_service.close()
     _file_names = list(file_list.values())
     _file_name = _file_names[0]
@@ -1388,23 +1390,24 @@ async def gdrive_handler(link: str, upload_mode: str, update: Update, context: C
                 files_dict[file_id] = file_name
                 total_size = int(_meta['size'])
             await edit_or_reply(tg_msg, f"⏳ <b>Downloading started for </b><code>{file_name}</code>", update, context)
+            await delete_download_status()
             logger.info(f"Calling gdrive_files_handler() for {len(files_dict)} file")
             asyncio.run_coroutine_threadsafe(gdrive_files_handler(file_id, files_dict, file_path, gdrive_service, total_size,
                                                                   tg_msg, update, context, _loop, upload_mode, folder_name), _loop)
     else:
         await edit_or_reply(None, "❗<b>Failed to get the GDrive ID from given link.</b> Please validate the link and retry", update, context)
 
-async def reply_handler(reply_doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE, upload_mode: str,
-                        loop: asyncio.events.AbstractEventLoop) -> None:
-    tg_file_path, tg_msg = await get_tg_file(reply_doc, update, context, loop)
+async def reply_handler(reply_doc: Document, update: Update, context: ContextTypes.DEFAULT_TYPE, upload_mode: str) -> None:
+    tg_file_path, tg_msg = await get_tg_file(reply_doc, update, context)
     if tg_file_path is None:
         await edit_or_reply(tg_msg, f"❗<b>Failed to download file, please check /{LOG_CMD} for more details</b>", update, context)
     elif magic.from_file(tg_file_path, mime=True) == "application/x-bittorrent":
         logger.info(f"Adding file to download: {reply_doc.file_name}")
         try:
             aria_obj = aria2c.add_torrent(torrent_file_path=tg_file_path)
-            TASK_UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
-            TASK_CHAT_DICT[aria_obj.gid] = update.message.chat_id
+            async with LOCK:
+                TASK_UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
+                TASK_CHAT_DICT[aria_obj.gid] = update.message.chat_id
             if aria_obj.has_failed is False:
                 _msg = f"📥 <b>Download started</b> ✔"
             else:
@@ -1416,7 +1419,8 @@ async def reply_handler(reply_doc: Document, update: Update, context: ContextTyp
         file_path = f"{DOWNLOAD_PATH}/{reply_doc.file_name}"
         shutil.move(src=tg_file_path, dst=file_path)
         up_args = get_up_args(upload_mode, file_path, reply_doc.file_id, update.message.chat_id)
-        TASK_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
+        async with LOCK:
+            TASK_CHAT_DICT[reply_doc.file_id] = update.message.chat_id
         if not any([up_args['extract'], up_args['upload'], up_args['leech']]):
             await edit_or_reply(tg_msg, f"<b>File: </b><code>{reply_doc.file_name}</code> <b>is saved, use ngrok url to "
                                         f"access</b>{await get_ngrok_file_url(reply_doc.file_name)}", update, context)
@@ -1455,13 +1459,8 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
         upload_mode = await get_upload_mode(cmd_txt, unzip, leech)
         if reply_msg := update.message.reply_to_message:
             if reply_doc := reply_msg.document:
-                try:
-                    _loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    logger.error(f"Failed to get running loop for processing of: {reply_doc.file_name}")
-                    await reply_message(f"⁉️<b>File: </b><code>{reply_doc.file_name}</code> <b>failed to initiate process, please retry</b>", update, context)
-                else:
-                    asyncio.run_coroutine_threadsafe(reply_handler(reply_doc, update, context, upload_mode, _loop), _loop)
+                asyncio.run_coroutine_threadsafe(reply_handler(reply_doc, update, context, upload_mode), asyncio.get_running_loop())
+                return
             elif reply_text := reply_msg.text:
                 link = reply_text
             else:
@@ -1491,9 +1490,10 @@ async def aria_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
         if aria_obj is not None:
             if aria_obj.has_failed is False:
                 logger.info(f"Download started: {aria_obj.name} with GID: {aria_obj.gid}")
-                TASK_UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
-                TASK_CHAT_DICT[aria_obj.gid] = update.message.chat_id
-                TASK_ID_DICT[aria_obj.gid] = ''.join(choice(ascii_letters) for i in range(8))
+                async with LOCK:
+                    TASK_UPLOAD_MODE_DICT[aria_obj.gid] = upload_mode
+                    TASK_CHAT_DICT[aria_obj.gid] = update.message.chat_id
+                    TASK_ID_DICT[aria_obj.gid] = ''.join(choice(ascii_letters) for i in range(8))
                 await reply_message(f"📥 <b>Download started</b> ✔", update, context)
                 await delete_download_status()
             else:
@@ -1540,10 +1540,12 @@ async def qbit_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, unzip:
                 await reply_message(f"🧲 <b>Torrent added</b> ✔", update, context)
                 await delete_download_status()
                 for torrent in qb_client.torrents_info(status_filter='all', sort='added_on', reverse=True, limit=1):
-                    TASK_UPLOAD_MODE_DICT[torrent.get('hash')] = upload_mode
-                    TASK_CHAT_DICT[torrent.get('hash')] = update.message.chat_id
-                    TASK_STATUS_MSG_DICT[torrent.get('hash')] = "NOT_SENT"
-                    TASK_ID_DICT[torrent.get('hash')] = ''.join(choice(ascii_letters) for i in range(8))
+                    async with LOCK:
+                        if not torrent.get('hash') in TASK_CHAT_DICT:
+                            TASK_UPLOAD_MODE_DICT[torrent.get('hash')] = upload_mode
+                            TASK_CHAT_DICT[torrent.get('hash')] = update.message.chat_id
+                            TASK_STATUS_MSG_DICT[torrent.get('hash')] = "NOT_SENT"
+                            TASK_ID_DICT[torrent.get('hash')] = ''.join(choice(ascii_letters) for i in range(8))
             else:
                 await reply_message("❗ <b>Failed to add it</b>\n⚠️ <i>Kindly verify the given link and retry</i>", update, context)
         except IndexError:
@@ -1747,12 +1749,18 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             total_downloads.extend([torrent for torrent in qb_client.torrents_info(status_filter="all")])
             total_downloads.extend([down for down in aria2c.get_downloads()])
+            total_downloads.extend([up_down for up_down in UPDOWN_LIST if up_down.status == "IN_PROGRESS"])
             target_chat_ids: Set[int] = set()
             dl_report = ''
             for torrent in natsorted(seq=total_downloads,
-                                     key=lambda x: x.name if isinstance(x, aria2p.Download) else x.get('name')):
+                                     key=lambda x: x.name if isinstance(x, aria2p.Download) else x.get('name') if
+                                     isinstance(x, qbittorrentapi.TorrentDictionary) else x.file_name):
                 if isinstance(torrent, qbittorrentapi.TorrentDictionary):
                     present_in_dict = torrent.get('hash') in TASK_STATUS_MSG_DICT
+                    if not torrent.get('hash') in TASK_ID_DICT:
+                        async with LOCK:
+                            TASK_ID_DICT[torrent.get('hash')] = ''.join(choice(ascii_letters) for i in range(8))
+                            TASK_CHAT_DICT[torrent.get('hash')] = list(AUTHORIZED_USERS)[0]
                     if torrent.state_enum.is_complete or "pausedUP" == torrent.state_enum.value:
                         if present_in_dict:
                             if TASK_STATUS_MSG_DICT.get(torrent.get('hash')) == "NOT_SENT":
@@ -1763,6 +1771,7 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 send_status_update(msg)
                                 TASK_STATUS_MSG_DICT[torrent.get('hash')] = "SENT"
                                 asyncio.run_coroutine_threadsafe(coro=trigger_extract_upload(torrent, torrent.get('hash')), loop=asyncio.get_running_loop())
+                                await delete_download_status()
                     elif torrent.state_enum.is_errored:
                         dl_report += f"{await get_qbit_info(torrent.get('hash'), qb_client)}{await get_action_str(torrent)}\n"
                         if present_in_dict:
@@ -1775,7 +1784,7 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
                         TASK_STATUS_MSG_DICT[torrent.get('hash')] = "NOT_SENT"
                     if torrent.get('hash') in TASK_CHAT_DICT:
                         target_chat_ids.add(TASK_CHAT_DICT[torrent.get('hash')])
-                else:
+                elif isinstance(torrent, aria2p.Download):
                     down = torrent
                     if down.is_complete:
                         if not down.is_metadata and not down.followed_by_ids:
@@ -1784,6 +1793,7 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 send_status_update(msg)
                                 TASK_STATUS_MSG_DICT[down.gid] = "SENT"
                                 asyncio.run_coroutine_threadsafe(coro=trigger_extract_upload(down, down.gid), loop=asyncio.get_running_loop())
+                                await delete_download_status()
                         else:
                             for fgid in down.followed_by_ids:
                                 TASK_UPLOAD_MODE_DICT[fgid] = TASK_UPLOAD_MODE_DICT.get(down.gid) if down.gid in TASK_UPLOAD_MODE_DICT else "M"
@@ -1802,6 +1812,9 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
                         TASK_STATUS_MSG_DICT[down.gid] = "NOT_SENT"
                     if down.gid in TASK_CHAT_DICT:
                         target_chat_ids.add(TASK_CHAT_DICT[down.gid])
+                elif isinstance(torrent, UpDownProgressUpdate):
+                    dl_report += f"{await torrent.get_status_msg()}\n\n"
+                    target_chat_ids.add(int(torrent.user_id) if torrent.user_id else int(list(AUTHORIZED_USERS)[0]))
             for chat_id in target_chat_ids:
                 async with LOCK:
                     chat_id_present = chat_id in CHAT_UPDATE_MSG_DICT
@@ -1815,7 +1828,7 @@ async def aria_qbit_listener(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await delete_download_status()
             qb_client.auth_log_out()
         except (qbittorrentapi.APIConnectionError, aria2p.ClientException, RuntimeError) as err:
-            logger.warning(f"Error in aria qbit listener [{str(err)}]")
+            logger.warning(f"Error in aria qbit listener [{err.__class__.__name__}]")
         except errors.RPCError as err:
             logger.debug(f"Failed to update download status [{err.ID}]")
 
